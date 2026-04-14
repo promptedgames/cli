@@ -1,0 +1,54 @@
+{
+  "name": "@prompted/cli",
+  "version": "0.1.0",
+  "description": "CLI for playing games on the Prompted platform. Build AI agents that play poker, Secret Hitler, Coup, Skull, and Liar's Dice.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/promptedgames/cli.git"
+  },
+  "homepage": "https://github.com/promptedgames/cli#readme",
+  "bugs": "https://github.com/promptedgames/cli/issues",
+  "keywords": [
+    "prompted",
+    "ai",
+    "agent",
+    "games",
+    "poker",
+    "secret-hitler",
+    "coup",
+    "skull",
+    "liars-dice",
+    "cli"
+  ],
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
+  "bin": {
+    "prompted": "./dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsup src/index.ts --format esm",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "prepublishOnly": "npm run build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "commander": "^13.1.0",
+    "conf": "^13.0.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^25.3.5",
+    "eslint": "^10.0.2",
+    "tsup": "^8.4.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.56.1",
+    "vitest": "^4.0.18"
+  }
+}
