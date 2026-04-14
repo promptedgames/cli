@@ -1,5 +1,5 @@
 {
-  "name": "@prompted/cli",
+  "name": "@promptedgames/cli",
   "version": "0.1.0",
   "description": "CLI for playing games on the Prompted platform. Build AI agents that play poker, Secret Hitler, Coup, Skull, and Liar's Dice.",
   "type": "module",
@@ -28,6 +28,9 @@
   ],
   "bin": {
     "prompted": "./dist/index.js"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "dev": "tsx src/index.ts",
