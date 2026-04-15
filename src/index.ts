@@ -60,8 +60,18 @@ function appendFormatParam(path: string, format?: string): string {
 
 function outputStateText(data: unknown, format?: string) {
   if (isTextFormat(format) && typeof data === 'object' && data !== null) {
-    const stateText = (data as { stateText?: unknown }).stateText
+    const obj = data as Record<string, unknown>
+    const stateText = obj.stateText
     if (typeof stateText === 'string' && stateText.length > 0) {
+      if (obj.reason !== undefined) console.log(`reason: ${obj.reason}`)
+      if (obj.nextSinceEventId !== undefined) console.log(`nextSinceEventId: ${obj.nextSinceEventId}`)
+      if (obj.eventId !== undefined) console.log(`eventId: ${obj.eventId}`)
+      if (Array.isArray(obj.missedTurns) && obj.missedTurns.length > 0) {
+        for (const mt of obj.missedTurns as Array<{ action: string; summary: string }>) {
+          console.log(`WARNING: ${mt.summary}`)
+        }
+      }
+      console.log('')
       console.log(stateText)
       return
     }
@@ -163,12 +173,95 @@ async function queueForMatch(body: Record<string, unknown>): Promise<{ queueId: 
   const errorMsg = result.error ?? ''
   const queueId = result.data?.queueId
   if (queueId && errorMsg.toLowerCase().includes('already queued')) {
-    console.error('Cancelled stale queue entry, re-queuing...')
-    await request(`/api/matchmaking/queue/${encodeURIComponent(queueId)}`, { method: 'DELETE' })
-    return request('/api/matchmaking/queue', jsonBody(body))
+    const cancelResult = await requestMayFail<{ error?: string }>(
+      `/api/matchmaking/queue/${encodeURIComponent(queueId)}`,
+      { method: 'DELETE' },
+    )
+
+    if (cancelResult.ok) {
+      console.error('Cancelled stale queue entry, re-queuing...')
+      return request('/api/matchmaking/queue', jsonBody(body))
+    }
+
+    // Queue entry is in ready_check state, wait for it to resolve then re-queue
+    if (cancelResult.error?.includes('already ready_check')) {
+      return waitForReadyCheckAndRequeue(queueId, body)
+    }
+
+    fail(cancelResult.error ?? `Cancel failed: ${cancelResult.status}`)
   }
 
   fail(result.error ?? `Request failed: ${result.status}`)
+}
+
+/**
+ * When a stale queue entry is stuck in ready_check state, wait for the
+ * server-side ready check to resolve (match or expiry), then re-queue.
+ */
+async function waitForReadyCheckAndRequeue(
+  staleQueueId: string,
+  body: Record<string, unknown>,
+): Promise<{ queueId: string; matched?: boolean; gameId?: string }> {
+  console.error('Waiting for ready check to expire...')
+
+  const MAX_WAIT_MS = 35_000
+  const deadline = Date.now() + MAX_WAIT_MS
+  let confirmAttempted = false
+
+  while (Date.now() < deadline) {
+    const waitResult = await requestMayFail<WaitResponse>(
+      `/api/matchmaking/wait?queue_id=${encodeURIComponent(staleQueueId)}`,
+    )
+
+    // Match completed successfully
+    if (waitResult.ok && waitResult.data?.matched && waitResult.data.gameId) {
+      return { queueId: staleQueueId, matched: true, gameId: waitResult.data.gameId }
+    }
+
+    // Ready check still pending. Confirm once so the match can proceed if
+    // all other players are also ready.
+    if (waitResult.ok && waitResult.data?.readyCheck && waitResult.data.readyCheckId) {
+      if (!waitResult.data.alreadyConfirmed && !confirmAttempted) {
+        confirmAttempted = true
+        console.error('Found pending ready check, confirming...')
+        const readyResult = await requestMayFail<ReadyResponse>(
+          '/api/matchmaking/ready',
+          jsonBody({ readyCheckId: waitResult.data.readyCheckId }),
+        )
+        if (readyResult.ok && readyResult.data?.allReady && readyResult.data.gameId) {
+          return { queueId: staleQueueId, matched: true, gameId: readyResult.data.gameId }
+        }
+      }
+      // Wait returned immediately (unconfirmed or just confirmed).
+      // Brief sleep before next iteration where wait will long-poll.
+      await sleep(2000)
+      continue
+    }
+
+    // Queue entry expired or removed. Re-queue.
+    if (
+      (waitResult.ok && waitResult.data?.reason === 'expired') ||
+      (!waitResult.ok && (waitResult.status === 404 || waitResult.status === 410))
+    ) {
+      console.error('Ready check expired, re-queuing...')
+      return request('/api/matchmaking/queue', jsonBody(body))
+    }
+
+    // Long-poll timeout or other reason. The ready check should have
+    // expired by now; try to re-queue directly.
+    const retryResult = await requestMayFail<{ queueId?: string; matched?: boolean; gameId?: string }>(
+      '/api/matchmaking/queue', jsonBody(body),
+    )
+    if (retryResult.ok) {
+      console.error('Re-queued successfully.')
+      return retryResult.data as { queueId: string; matched?: boolean; gameId?: string }
+    }
+
+    // Scheduler hasn't cleaned up yet. Wait briefly and retry.
+    await sleep(3000)
+  }
+
+  fail('Ready check did not expire in time. Try again shortly.')
 }
 
 function jsonBody(data: unknown): { method: string; headers: Record<string, string>; body: string } {
