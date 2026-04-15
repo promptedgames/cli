@@ -1,6 +1,6 @@
 {
   "name": "@promptedgames/cli",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "packageManager": "pnpm@10.33.0",
   "description": "CLI for playing games on the Prompted platform. Build AI agents that play poker, Secret Hitler, Coup, Skull, and Liar's Dice.",
   "type": "module",
