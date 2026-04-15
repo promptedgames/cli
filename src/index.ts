@@ -552,10 +552,10 @@ program.command('queue')
   })
 
 program.command('match-wait')
-  .description('Wait for matchmaking to complete')
+  .description('Wait for matchmaking to complete (polls until matched)')
   .argument('<queue-id>', 'Queue ID')
   .action(async (queueId) => {
-    output(await request(`/api/matchmaking/wait?queue_id=${encodeURIComponent(queueId)}`))
+    await pollUntilMatched(queueId)
   })
 
 program.command('queue-cancel')
@@ -565,6 +565,80 @@ program.command('queue-cancel')
     const safeQueueId = validateId(queueId, 'queue-id')
     output(await request(`/api/matchmaking/queue/${safeQueueId}`, { method: 'DELETE' }))
   })
+
+interface WaitResponse {
+  matched: boolean
+  gameId?: string
+  gameType?: string
+  reason?: string
+  readyCheck?: boolean
+  readyCheckId?: string
+  expiresAt?: string
+  playerCount?: number
+  confirmedCount?: number
+  alreadyConfirmed?: boolean
+}
+
+interface ReadyResponse {
+  ok: boolean
+  allReady?: boolean
+  gameId?: string
+  error?: string
+}
+
+/** Shared poll loop: long-polls /wait, handles ready-check handshake, outputs result. */
+async function pollUntilMatched(queueId: string): Promise<void> {
+  while (true) {
+    try {
+      const data = await request<WaitResponse>(
+        `/api/matchmaking/wait?queue_id=${encodeURIComponent(queueId)}`
+      )
+
+      if (data.matched && data.gameId) {
+        output(data)
+        return
+      }
+
+      // Ready check: server is asking us to confirm
+      if (data.readyCheck && data.readyCheckId) {
+        if (!data.alreadyConfirmed) {
+          console.error(
+            `Match found! Game: ${data.gameType ?? 'unknown'}, ` +
+            `players: ${data.playerCount ?? '?'}. Confirming ready...`
+          )
+          try {
+            const readyResult = await request<ReadyResponse>(
+              '/api/matchmaking/ready',
+              jsonBody({ readyCheckId: data.readyCheckId }),
+            )
+
+            if (readyResult.allReady && readyResult.gameId) {
+              output({ matched: true, gameId: readyResult.gameId, gameType: data.gameType })
+              return
+            }
+
+            // Confirmed but waiting for others, keep polling
+            console.error('Confirmed. Waiting for other players...')
+          } catch {
+            // Confirmation failed (expired, etc.), keep polling
+            // The server will return us to waiting or expired
+            console.error('Ready check failed, returning to queue...')
+          }
+        }
+        // Already confirmed or just confirmed, keep polling for the final match
+        continue
+      }
+
+      if (data.reason === 'expired') {
+        fail('Queue entry expired (stopped polling too long)')
+      }
+
+      // Timeout or other reason, just retry
+    } catch {
+      await new Promise(r => setTimeout(r, 2000))
+    }
+  }
+}
 
 program.command('quickmatch')
   .description('Queue and wait until matched (system picks the game)')
@@ -580,23 +654,7 @@ program.command('quickmatch')
       return
     }
 
-    // Poll until matched
-    while (true) {
-      try {
-        const data = await request<{ matched: boolean; gameId?: string; gameType?: string; reason?: string }>(
-          `/api/matchmaking/wait?queue_id=${encodeURIComponent(queueResult.queueId)}`
-        )
-
-        if (data.matched && data.gameId) {
-          output(data)
-          return
-        }
-
-        // Timeout, retry
-      } catch {
-        await new Promise(r => setTimeout(r, 2000))
-      }
-    }
+    await pollUntilMatched(queueResult.queueId)
   })
 
 // ── Init command ────────────────────────────────────────────
