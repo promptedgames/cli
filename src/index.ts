@@ -3,13 +3,14 @@
 import { Command, Option } from 'commander'
 import Conf from 'conf'
 import crypto from 'node:crypto'
+import { execSync } from 'node:child_process'
 import fs from 'node:fs'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import readline from 'node:readline'
 
 const require = createRequire(import.meta.url)
-const pkg = require('../package.json') as { version: string }
+const pkg = require('../package.json') as { name: string; version: string }
 import {
   AGENT_MD,
   TEXAS_HOLDEM_MD,
@@ -24,6 +25,15 @@ import {
 const config = new Conf({ projectName: 'prompted' })
 
 const DEFAULT_SERVER = 'https://prompted.games'
+const CLI_USER_AGENT = `prompted-cli/${pkg.version}`
+const CLI_UPDATE_COMMAND = `npm i -g ${pkg.name}`
+
+interface CliVersionTooOldError {
+  error?: string
+  message?: string
+  minimumVersion?: string
+  currentVersion?: string
+}
 
 function getServer(): string {
   return (program.opts().host as string) ?? process.env.PROMPTED_SERVER ?? DEFAULT_SERVER
@@ -84,6 +94,66 @@ function fail(message: string, exitCode = 1): never {
   process.exit(exitCode)
 }
 
+function withUserAgent(headers: Record<string, string>): Record<string, string> {
+  return { ...headers, 'User-Agent': CLI_USER_AGENT }
+}
+
+function shouldPromptForUpdate(): boolean {
+  return Boolean(process.stdin.isTTY && process.stdout.isTTY && !process.env.CI)
+}
+
+function promptYesNo(question: string): Promise<boolean> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close()
+      resolve(answer.trim().toLowerCase().startsWith('y'))
+    })
+  })
+}
+
+function runCliUpdate(): boolean {
+  try {
+    execSync(CLI_UPDATE_COMMAND, { stdio: 'inherit' })
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function enforceMinimumCliVersion(status: number, body: unknown): Promise<void> {
+  if (status !== 426 || typeof body !== 'object' || body === null) return
+
+  const err = body as CliVersionTooOldError
+  if (err.error !== 'cli_version_too_old') return
+
+  const message = typeof err.message === 'string' && err.message.length > 0
+    ? err.message
+    : 'Your Prompted CLI version is too old. Please update.'
+  const minimumVersion = typeof err.minimumVersion === 'string' && err.minimumVersion.length > 0
+    ? err.minimumVersion
+    : 'unknown'
+  const currentVersion = typeof err.currentVersion === 'string' && err.currentVersion.length > 0
+    ? err.currentVersion
+    : pkg.version
+  const details = `Current version: ${currentVersion}. Minimum required: ${minimumVersion}.`
+
+  if (shouldPromptForUpdate()) {
+    console.error(message)
+    console.error(details)
+    const shouldUpdate = await promptYesNo(`Run \`${CLI_UPDATE_COMMAND}\` now? (y/n) `)
+    if (shouldUpdate) {
+      console.error(`Running: ${CLI_UPDATE_COMMAND}`)
+      if (runCliUpdate()) {
+        fail('CLI updated successfully. Please rerun your previous command.')
+      }
+      fail(`Automatic update failed. Run \`${CLI_UPDATE_COMMAND}\` manually.`)
+    }
+  }
+
+  fail(`${message} ${details} Update with: ${CLI_UPDATE_COMMAND}`)
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
@@ -105,6 +175,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const headers: Record<string, string> = {
     ...((options?.headers as Record<string, string>) ?? {}),
   }
+  headers['User-Agent'] = CLI_USER_AGENT
   // Priority: token > userId (dev fallback)
   if (token) {
     headers['Authorization'] = `Bearer ${token}`
@@ -120,6 +191,8 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     if (!res.ok) fail(`Request failed: ${res.status}`)
     fail('Invalid JSON response')
   }
+
+  await enforceMinimumCliVersion(res.status, body)
 
   if (res.status === 401) {
     fail('Authentication failed. Run `prompted login` to sign in again.')
@@ -140,6 +213,7 @@ async function requestMayFail<T>(path: string, options?: RequestInit): Promise<{
   const headers: Record<string, string> = {
     ...((options?.headers as Record<string, string>) ?? {}),
   }
+  headers['User-Agent'] = CLI_USER_AGENT
   if (token) {
     headers['Authorization'] = `Bearer ${token}`
   } else if (userId) {
@@ -153,6 +227,8 @@ async function requestMayFail<T>(path: string, options?: RequestInit): Promise<{
   } catch {
     body = null
   }
+
+  await enforceMinimumCliVersion(res.status, body)
 
   if (!res.ok) {
     const msg = (body as { error?: string } | null)?.error ?? `Request failed: ${res.status}`
@@ -313,10 +389,12 @@ program.command('login')
       // Step 1: Request device code
       const startRes = await fetch(`${getServer()}/api/auth/device/code`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: withUserAgent({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ client_id: clientId }),
       })
       if (!startRes.ok) {
+        const err = await startRes.json().catch(() => null)
+        await enforceMinimumCliVersion(startRes.status, err)
         fail('Failed to start device login')
       }
       const start = await startRes.json() as {
@@ -355,7 +433,7 @@ program.command('login')
         try {
           response = await fetch(`${getServer()}/api/auth/device/token`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: withUserAgent({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({
               grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
               device_code: start.device_code,
@@ -363,6 +441,7 @@ program.command('login')
             }),
           })
           body = await response.json().catch(() => ({})) as Record<string, unknown>
+          await enforceMinimumCliVersion(response.status, body)
           networkRetries = 0
         } catch {
           networkRetries += 1
@@ -378,7 +457,7 @@ program.command('login')
           // We don't get userId from the token response, so fetch /api/me
           try {
             const meRes = await fetch(`${getServer()}/api/me`, {
-              headers: { 'Authorization': `Bearer ${body.access_token as string}` },
+              headers: withUserAgent({ 'Authorization': `Bearer ${body.access_token as string}` }),
             })
             if (meRes.ok) {
               const me = await meRes.json() as { id?: string; name?: string }
