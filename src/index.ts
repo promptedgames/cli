@@ -39,11 +39,50 @@ function getServer(): string {
   return (program.opts().host as string) ?? process.env.PROMPTED_SERVER ?? DEFAULT_SERVER
 }
 
+// ── Agent identity (research mode) ──────────────────────────
+
+interface AgentProfile {
+  id: string
+  name: string
+  token: string
+}
+
+// Agent management commands always act as the main account, even when
+// --as / PROMPTED_AGENT is set (an agent can't manage agents).
+let forceMainIdentity = false
+
+function getAgentProfiles(): Record<string, AgentProfile> {
+  return (config.get('agents') as Record<string, AgentProfile> | undefined) ?? {}
+}
+
+function setAgentProfiles(agents: Record<string, AgentProfile>): void {
+  config.set('agents', agents)
+}
+
+function getActiveAgentName(): string | null {
+  if (forceMainIdentity) return null
+  const name = (program.opts().as as string | undefined) ?? process.env.PROMPTED_AGENT
+  return name?.trim() ? name.trim() : null
+}
+
+function getActiveAgent(): AgentProfile | null {
+  const name = getActiveAgentName()
+  if (!name) return null
+  const agent = getAgentProfiles()[name]
+  if (!agent) {
+    fail(`Unknown agent "${name}". Run \`prompted agent list\` to see stored agents, or create one with \`prompted agent create --name ${name}\`.`)
+  }
+  return agent
+}
+
 function getToken(): string | null {
+  const agent = getActiveAgent()
+  if (agent) return agent.token
   return process.env.PROMPTED_TOKEN ?? config.get('token') as string | null ?? null
 }
 
 function getUserId(): string | null {
+  if (getActiveAgentName()) return null // never mix agent identity with the dev user-id fallback
   return process.env.PROMPTED_USER_ID ?? config.get('userId') as string | null ?? null
 }
 
@@ -267,6 +306,14 @@ async function queueForMatch(body: Record<string, unknown>): Promise<{ queueId: 
     fail(cancelResult.error ?? `Cancel failed: ${cancelResult.status}`)
   }
 
+  if (result.status === 403) {
+    // Queue pool is inferred from identity: agents → research, main → ranked.
+    const hint = getActiveAgentName()
+      ? 'Agents play research quickmatch; ranked quickmatch needs your main account (drop --as / PROMPTED_AGENT).'
+      : 'For research quickmatch, play as an agent: `prompted agent create`, then --as <name> (or PROMPTED_AGENT).'
+    fail(`${errorMsg || 'Forbidden'} ${hint}`)
+  }
+
   fail(result.error ?? `Request failed: ${result.status}`)
 }
 
@@ -369,6 +416,7 @@ program
   .description('Prompted CLI - play games from the terminal')
   .addOption(new Option('--host <url>', 'Server URL').default(process.env.PROMPTED_SERVER ?? DEFAULT_SERVER).hideHelp())
   .option('--pretty', 'Pretty-print JSON output')
+  .option('--as <agent-name>', 'Act as a stored research agent (or set PROMPTED_AGENT)')
 
 // ── Auth commands ───────────────────────────────────────────
 
@@ -514,16 +562,22 @@ program.command('logout')
 program.command('config')
   .description('Show current config')
   .action(() => {
+    const agent = getActiveAgent()
     const token = getToken()
     const userId = getUserId()
-    let authMethod: 'token' | 'user_id' | 'none' = 'none'
-    if (token) authMethod = 'token'
+    let authMethod: 'agent' | 'token' | 'user_id' | 'none' = 'none'
+    if (agent) authMethod = 'agent'
+    else if (token) authMethod = 'token'
     else if (userId) authMethod = 'user_id'
     output({
       server: getServer(),
       hasToken: !!token,
       authMethod,
+      identity: agent
+        ? { kind: 'agent', name: agent.name, id: agent.id }
+        : { kind: 'main', userId },
       userId,
+      storedAgents: Object.keys(getAgentProfiles()),
     })
   })
 
@@ -559,6 +613,89 @@ program.command('me')
   .description('Get current user info')
   .action(async () => {
     output(await request('/api/me'))
+  })
+
+// ── Agent commands (research mode) ──────────────────────────
+
+interface AgentListEntry {
+  id: string
+  name: string
+  ownerUserId: string
+  createdAt: string
+  gamesPlayed: number
+  ratings: Array<{ gameType: string; rating: number; gamesPlayed: number; gamesWon: number }>
+}
+
+/** Resolve an agent name to its id, preferring the local profile store. */
+async function resolveAgentId(name: string): Promise<string> {
+  const local = getAgentProfiles()[name]
+  if (local) return local.id
+  const data = await request<{ agents: AgentListEntry[] }>('/api/agents')
+  const match = data.agents.find((a) => a.name === name)
+  if (!match) {
+    fail(`No agent named "${name}". Run \`prompted agent list\` to see your agents.`)
+  }
+  return match.id
+}
+
+const agentCmd = program.command('agent')
+  .description('Manage research agents (identities for research-mode play)')
+
+agentCmd.command('create')
+  .description('Create a research agent (name is generated if omitted)')
+  .option('--name <name>', 'Agent name (any name; unique per owner)')
+  .action(async (opts) => {
+    forceMainIdentity = true
+    const body: Record<string, unknown> = {}
+    if (opts.name) body.name = opts.name
+    const data = await request<{ id: string; name: string; token: string }>('/api/agents', jsonBody(body))
+    const agents = getAgentProfiles()
+    agents[data.name] = { id: data.id, name: data.name, token: data.token }
+    setAgentProfiles(agents)
+    output({
+      ...data,
+      hint: `Token stored locally. Play as this agent with --as ${data.name}, PROMPTED_AGENT=${data.name}, or PROMPTED_TOKEN=<token> in a parallel process.`,
+    })
+  })
+
+agentCmd.command('list')
+  .description('List your research agents with ratings and games played')
+  .action(async () => {
+    forceMainIdentity = true
+    const data = await request<{ agents: AgentListEntry[] }>('/api/agents')
+    const stored = getAgentProfiles()
+    output({
+      agents: data.agents.map((a) => ({ ...a, hasStoredToken: !!stored[a.name] })),
+    })
+  })
+
+agentCmd.command('token')
+  .description('Mint a fresh token for an agent and store it')
+  .argument('<name>', 'Agent name')
+  .action(async (name) => {
+    forceMainIdentity = true
+    const agentId = await resolveAgentId(name)
+    const data = await request<{ id: string; name: string; token: string }>(
+      `/api/agents/${encodeURIComponent(agentId)}/token`,
+      jsonBody({}),
+    )
+    const agents = getAgentProfiles()
+    agents[data.name] = { id: data.id, name: data.name, token: data.token }
+    setAgentProfiles(agents)
+    output({ ...data, hint: 'Token stored locally.' })
+  })
+
+agentCmd.command('remove')
+  .description('Revoke an agent (invalidates its tokens, frees a cap slot)')
+  .argument('<name>', 'Agent name')
+  .action(async (name) => {
+    forceMainIdentity = true
+    const agentId = await resolveAgentId(name)
+    await request(`/api/agents/${encodeURIComponent(agentId)}`, { method: 'DELETE' })
+    const agents = getAgentProfiles()
+    delete agents[name]
+    setAgentProfiles(agents)
+    output({ ok: true, removed: name })
   })
 
 // ── Game read commands ──────────────────────────────────────
@@ -602,26 +739,78 @@ program.command('events')
 program.command('leaderboard')
   .description('Show leaderboard')
   .option('--type <type>', 'Game type', 'texas-holdem')
+  .option('--mode <mode>', 'Ladder: ranked or research', 'ranked')
   .action(async (opts) => {
-    output(await request(`/api/leaderboard?type=${encodeURIComponent(opts.type)}`))
+    if (opts.mode !== 'ranked' && opts.mode !== 'research') {
+      fail(`Invalid --mode "${opts.mode}". Use 'ranked' or 'research'.`)
+    }
+    const data = await request<{ leaderboard?: Array<Record<string, unknown>> }>(
+      `/api/leaderboard?type=${encodeURIComponent(opts.type)}&mode=${encodeURIComponent(opts.mode)}`
+    )
+    // Research agents have no globally unique names: render `mary <bobby>`.
+    if (opts.mode === 'research' && Array.isArray(data.leaderboard)) {
+      for (const entry of data.leaderboard) {
+        if (typeof entry.name === 'string' && typeof entry.ownerName === 'string') {
+          entry.display = `${entry.name} <${entry.ownerName}>`
+        }
+      }
+    }
+    output(data)
   })
 
 // ── Game write commands ─────────────────────────────────────
 
+/**
+ * Custom games are research mode and require an agent identity; ranked
+ * quickmatch requires the main account. Turn the server's 403 into a hint
+ * about how to switch identity locally.
+ */
+async function requestWithIdentityHint<T>(path: string, options: RequestInit): Promise<T> {
+  const result = await requestMayFail<T>(path, options)
+  if (result.ok) return result.data as T
+  if (result.status === 401) {
+    fail('Authentication failed. Run `prompted login` to sign in again.')
+  }
+  if (result.status === 403) {
+    const hint = getActiveAgentName()
+      ? 'You are acting as an agent (via --as / PROMPTED_AGENT). Drop it to use your main account.'
+      : 'Research play needs an agent identity: `prompted agent create`, then add --as <name> (or set PROMPTED_AGENT).'
+    fail(`${result.error ?? 'Forbidden'} ${hint}`)
+  }
+  fail(result.error ?? `Request failed: ${result.status}`)
+}
+
+/**
+ * Custom games are research mode: fail before hitting the network when we can
+ * tell locally that no agent identity is selected. A raw PROMPTED_TOKEN is
+ * assumed to be an agent token (the documented way to run parallel agents);
+ * the server gate is still authoritative either way.
+ */
+function requireResearchIdentity(): void {
+  if (getActiveAgentName() || process.env.PROMPTED_TOKEN?.trim()) return
+  fail(
+    'Custom games are research mode and need an agent identity. ' +
+    'Create one with `prompted agent create`, then select it with --as <name> or PROMPTED_AGENT=<name> ' +
+    '(or run the process with PROMPTED_TOKEN=<agent-token>).'
+  )
+}
+
 program.command('create')
-  .description('Create a new game')
+  .description('Create a custom game (research mode, requires an agent identity)')
   .requiredOption('--type <type>', 'Game type')
   .requiredOption('--max-players <n>', 'Max players', parseInt)
   .action(async (opts) => {
-    output(await request('/api/games', jsonBody({ type: opts.type, maxPlayers: opts.maxPlayers })))
+    requireResearchIdentity()
+    output(await requestWithIdentityHint('/api/games', jsonBody({ type: opts.type, maxPlayers: opts.maxPlayers })))
   })
 
 program.command('join')
-  .description('Join a game')
+  .description('Join a custom game (research mode, requires an agent identity)')
   .argument('<game-id>', 'Game ID')
   .action(async (gameId) => {
+    requireResearchIdentity()
     const safeGameId = validateId(gameId, 'game-id')
-    output(await request(`/api/games/${safeGameId}/join`, jsonBody({})))
+    output(await requestWithIdentityHint(`/api/games/${safeGameId}/join`, jsonBody({})))
   })
 
 program.command('turn')

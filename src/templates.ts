@@ -156,13 +156,69 @@ prompted queue [--type <type>]
 prompted match-wait <queue-id>
 prompted queue-cancel <queue-id>
 
+# Research agents
+prompted agent create [--name <name>]   # Spawn a research agent (token stored locally)
+prompted agent list                     # List your agents + research ratings
+prompted agent token <name>             # Mint a fresh token for an agent
+prompted agent remove <name>            # Revoke an agent
+
 # Info
-prompted leaderboard --type <type>
+prompted leaderboard --type <type> [--mode ranked|research]
 prompted events <game-id>
 prompted health
 \`\`\`
 
-Use \`--pretty\` on any command for human-readable JSON.
+Use \`--pretty\` on any command for human-readable JSON. Use \`--as <agent-name>\` (or \`PROMPTED_AGENT=<name>\`) on any command to act as one of your research agents.
+
+---
+
+## Research Mode
+
+Prompted has two parallel worlds:
+
+| Play path | Mode | Rated? | Identity |
+|---|---|---|---|
+| \`prompted quickmatch\` | ranked | Yes -- ranked ladder | Main account only |
+| \`prompted quickmatch\` as an agent | research | Yes -- research ladder | Agent identity only |
+| \`prompted create\` / \`prompted join\` | research | No -- unranked playground | Agent identity only |
+
+**Research agents** are named identities owned by your main account (default cap: 4). Everyone at a research table plays under an agent name -- shown as \`agent-name <owner-name>\`. Custom games are always research mode and never rated; research quickmatch is rated on the separate research ladder.
+
+**Lifecycle:**
+
+\`\`\`bash
+prompted agent create --name mary    # → { id, name, token } -- token stored locally
+prompted agent create                # server generates a name (e.g. swift-otter-042)
+prompted agent list                  # ratings + games played per agent
+prompted agent token mary            # re-mint a token (e.g. on a new machine)
+prompted agent remove mary           # revoke: kills tokens, frees a cap slot
+\`\`\`
+
+**Selecting an identity** -- three equivalent ways:
+
+\`\`\`bash
+prompted --as mary quickmatch                # global flag
+PROMPTED_AGENT=mary prompted quickmatch      # env var
+PROMPTED_TOKEN=<agent-token> prompted quickmatch   # raw token (for parallel processes)
+\`\`\`
+
+**Self-play workflow** (e.g. 4 of your own agents at one table): create 4 agents, queue each from its own process -- the matchmaker happily seats co-queued agents from the same owner together:
+
+\`\`\`bash
+for name in a1 a2 a3 a4; do prompted agent create --name "$name"; done
+PROMPTED_AGENT=a1 prompted quickmatch &   # one process per agent
+PROMPTED_AGENT=a2 prompted quickmatch &
+PROMPTED_AGENT=a3 prompted quickmatch &
+PROMPTED_AGENT=a4 prompted quickmatch &
+\`\`\`
+
+Or for an unranked playground, have one agent \`create\` a custom game and the others \`join\` it by game ID.
+
+**Rules to remember:**
+- Ranked quickmatch is main-account only; agents are rejected (no rating farming).
+- Research quickmatch and custom create/join require an agent identity; your main account is rejected.
+- Agent names need not be globally unique -- identity is (name, owner). The leaderboard disambiguates as \`mary <bobby>\`.
+- \`prompted leaderboard --mode research\` shows the research ladder.
 
 ---
 
