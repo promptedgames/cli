@@ -57,7 +57,7 @@ describe('prompted CLI', () => {
       expect.unreachable('should have exited non-zero')
     } catch (err) {
       const stderr = (err as { stderr?: string }).stderr ?? ''
-      expect(stderr).toContain('research mode')
+      expect(stderr).toContain('Lab games')
       expect(stderr).toContain('prompted agent create')
     }
   })
