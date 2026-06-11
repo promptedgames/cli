@@ -22,7 +22,11 @@ import {
 
 // ── Config ──────────────────────────────────────────────────
 
-const config = new Conf({ projectName: 'prompted' })
+// PROMPTED_CONFIG_DIR redirects credential storage (used by tests and sandboxes).
+const config = new Conf({
+  projectName: 'prompted',
+  ...(process.env.PROMPTED_CONFIG_DIR ? { cwd: process.env.PROMPTED_CONFIG_DIR } : {}),
+})
 
 const DEFAULT_SERVER = 'https://prompted.games'
 const CLI_USER_AGENT = `prompted-cli/${pkg.version}`
@@ -39,7 +43,12 @@ function getServer(): string {
   return (program.opts().host as string) ?? process.env.PROMPTED_SERVER ?? DEFAULT_SERVER
 }
 
-// ── Agent identity (Lab mode) ───────────────────────────────
+// ── Player identity (Lab profiles) ──────────────────────────
+//
+// `--player <name>` / PROMPTED_PLAYER selects a named Lab profile. On first
+// use the CLI resolves (or, for entry commands, creates) the profile through
+// the main account and stores its credential locally. A raw PROMPTED_TOKEN
+// bypasses profile resolution entirely (advanced orchestrator escape hatch).
 
 interface AgentProfile {
   id: string
@@ -47,9 +56,30 @@ interface AgentProfile {
   token: string
 }
 
-// Agent management commands always act as the main account, even when
-// --as / PROMPTED_AGENT is set (an agent can't manage agents).
-let forceMainIdentity = false
+// `--player` is accepted both before and after the subcommand; Commander only
+// parses program-level options before the subcommand, so we extract the flag
+// from argv up front. `--player` is global player selection and deliberately
+// distinct from `signup --name <account-name>`.
+let selectedPlayerFromArgv: string | null = null
+function extractPlayerFlag(argv: string[]): string[] {
+  const out: string[] = []
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (arg === '--player') {
+      const value = argv[i + 1]
+      if (!value || value.startsWith('-')) fail('--player requires a name')
+      selectedPlayerFromArgv = value
+      i++
+      continue
+    }
+    if (arg.startsWith('--player=')) {
+      selectedPlayerFromArgv = arg.slice('--player='.length)
+      continue
+    }
+    out.push(arg)
+  }
+  return out
+}
 
 function getAgentProfiles(): Record<string, AgentProfile> {
   return (config.get('agents') as Record<string, AgentProfile> | undefined) ?? {}
@@ -59,31 +89,106 @@ function setAgentProfiles(agents: Record<string, AgentProfile>): void {
   config.set('agents', agents)
 }
 
-function getActiveAgentName(): string | null {
-  if (forceMainIdentity) return null
-  const name = (program.opts().as as string | undefined) ?? process.env.PROMPTED_AGENT
+function getSelectedPlayer(): string | null {
+  const name = selectedPlayerFromArgv ?? process.env.PROMPTED_PLAYER
   return name?.trim() ? name.trim() : null
 }
 
-function getActiveAgent(): AgentProfile | null {
-  const name = getActiveAgentName()
-  if (!name) return null
-  const agent = getAgentProfiles()[name]
-  if (!agent) {
-    fail(`Unknown agent "${name}". Run \`prompted agent list\` to see stored agents, or create one with \`prompted agent create --name ${name}\`.`)
-  }
-  return agent
+/** The signed-in main account credential (never a profile token). */
+function getMainToken(): string | null {
+  return config.get('token') as string | null ?? null
 }
 
+// Effective Lab profile for this invocation, set by useLabProfile().
+let activeProfile: AgentProfile | null = null
+
 function getToken(): string | null {
-  const agent = getActiveAgent()
-  if (agent) return agent.token
-  return process.env.PROMPTED_TOKEN ?? config.get('token') as string | null ?? null
+  if (process.env.PROMPTED_TOKEN?.trim()) return process.env.PROMPTED_TOKEN
+  if (activeProfile) return activeProfile.token
+  return getMainToken()
 }
 
 function getUserId(): string | null {
-  if (getActiveAgentName()) return null // never mix agent identity with the dev user-id fallback
+  if (activeProfile) return null // never mix profile identity with the dev user-id fallback
   return process.env.PROMPTED_USER_ID ?? config.get('userId') as string | null ?? null
+}
+
+/**
+ * Resolve a Lab profile through the main account and store its credential.
+ * The server is idempotent: it returns the existing profile (with a fresh
+ * token, invalidating prior ones) or creates it when allowed.
+ */
+async function resolveLabProfile(name: string, createIfMissing: boolean): Promise<AgentProfile> {
+  const mainToken = getMainToken()
+  const mainUserId = process.env.PROMPTED_USER_ID ?? config.get('userId') as string | null ?? null
+  if (!mainToken && !mainUserId) {
+    fail('Not signed in. Run `prompted login` first, then retry with --player ' + name + '.')
+  }
+  const headers: Record<string, string> = withUserAgent({ 'Content-Type': 'application/json' })
+  if (mainToken) headers['Authorization'] = `Bearer ${mainToken}`
+  else if (mainUserId) headers['X-User-Id'] = mainUserId
+
+  const res = await fetch(`${getServer()}/api/agents/resolve`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ name, createIfMissing }),
+  })
+  let body: unknown = null
+  try { body = await res.json() } catch { /* handled below */ }
+  await enforceMinimumCliVersion(res.status, body)
+  if (!res.ok) {
+    const msg = (body as { error?: string } | null)?.error ?? `Profile resolution failed: ${res.status}`
+    fail(msg)
+  }
+
+  const data = body as { id: string; name: string; token: string; created?: boolean }
+  const profiles = getAgentProfiles()
+  const previous = profiles[data.name]
+  if (data.created) {
+    console.error(`Created new Lab profile "${data.name}" (ratings and history start fresh).`)
+  } else if (previous && previous.id !== data.id) {
+    console.error(`Note: "${data.name}" was removed and re-created on the server. This is a new profile with fresh ratings.`)
+  }
+  // Store under the exact name returned by the server (trimmed, case preserved).
+  profiles[data.name] = { id: data.id, name: data.name, token: data.token }
+  setAgentProfiles(profiles)
+  return profiles[data.name]
+}
+
+interface UseLabProfileOptions {
+  /** Entry commands (labmatch, custom create/join) may create the profile. */
+  createIfMissing?: boolean
+  /** Fail when no player is selected (instead of falling back to the main account). */
+  required?: boolean
+}
+
+/**
+ * Activate the selected Lab profile for this invocation, resolving it through
+ * the main account when no valid local credential exists. No-op when no
+ * player is selected (main account) or a raw PROMPTED_TOKEN is supplied.
+ */
+async function useLabProfile(opts: UseLabProfileOptions = {}): Promise<void> {
+  if (process.env.PROMPTED_TOKEN?.trim()) return // raw token bypasses resolution
+  const name = getSelectedPlayer()
+  if (!name) {
+    if (opts.required) {
+      fail('This command needs a Lab player. Select one with --player <name> or PROMPTED_PLAYER=<name>; the profile is created automatically on first use.')
+    }
+    return
+  }
+  const stored = getAgentProfiles()[name]
+  activeProfile = stored ?? await resolveLabProfile(name, opts.createIfMissing ?? false)
+}
+
+/** Refresh the active profile token once after a 401 (stale local credential). */
+async function refreshActiveProfile(): Promise<boolean> {
+  if (!activeProfile) return false
+  try {
+    activeProfile = await resolveLabProfile(activeProfile.name, false)
+    return true
+  } catch {
+    return false
+  }
 }
 
 function isPretty(): boolean {
@@ -206,7 +311,7 @@ function validateId(value: string, label: string): string {
 
 // ── HTTP Client ─────────────────────────────────────────────
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+async function request<T>(path: string, options?: RequestInit, isRetry = false): Promise<T> {
   const url = `${getServer()}${path}`
   const token = getToken()
   const userId = getUserId()
@@ -234,6 +339,10 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   await enforceMinimumCliVersion(res.status, body)
 
   if (res.status === 401) {
+    // A stale profile token gets refreshed once through the main account.
+    if (!isRetry && activeProfile && await refreshActiveProfile()) {
+      return request(path, options, true)
+    }
     fail('Authentication failed. Run `prompted login` to sign in again.')
   }
 
@@ -245,7 +354,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return body as T
 }
 
-async function requestMayFail<T>(path: string, options?: RequestInit): Promise<{ ok: boolean; status: number; data: T | null; error?: string }> {
+async function requestMayFail<T>(path: string, options?: RequestInit, isRetry = false): Promise<{ ok: boolean; status: number; data: T | null; error?: string }> {
   const url = `${getServer()}${path}`
   const token = getToken()
   const userId = getUserId()
@@ -270,6 +379,9 @@ async function requestMayFail<T>(path: string, options?: RequestInit): Promise<{
   await enforceMinimumCliVersion(res.status, body)
 
   if (!res.ok) {
+    if (res.status === 401 && !isRetry && activeProfile && await refreshActiveProfile()) {
+      return requestMayFail(path, options, true)
+    }
     const msg = (body as { error?: string } | null)?.error ?? `Request failed: ${res.status}`
     return { ok: false, status: res.status, data: body as T, error: msg }
   }
@@ -307,10 +419,9 @@ async function queueForMatch(body: Record<string, unknown>): Promise<{ queueId: 
   }
 
   if (result.status === 403) {
-    // Queue pool is inferred from identity: agents → lab, main → ranked.
-    const hint = getActiveAgentName()
-      ? 'Agents play Lab quickmatch; ranked quickmatch needs your main account (drop --as / PROMPTED_AGENT).'
-      : 'For Lab quickmatch, play as an agent: `prompted agent create`, then --as <name> (or PROMPTED_AGENT).'
+    const hint = getSelectedPlayer()
+      ? 'Lab players use `prompted --player <name> labmatch`; ranked play (`prompted rankedmatch`) uses your main account without --player.'
+      : 'Ranked play: `prompted rankedmatch`. Lab play: `prompted --player <name> labmatch`.'
     fail(`${errorMsg || 'Forbidden'} ${hint}`)
   }
 
@@ -416,7 +527,7 @@ program
   .description('Prompted CLI - play games from the terminal')
   .addOption(new Option('--host <url>', 'Server URL').default(process.env.PROMPTED_SERVER ?? DEFAULT_SERVER).hideHelp())
   .option('--pretty', 'Pretty-print JSON output')
-  .option('--as <agent-name>', 'Act as a stored Lab agent (or set PROMPTED_AGENT)')
+  .option('--player <name>', 'Play as this named Lab player (or set PROMPTED_PLAYER); created automatically on first use')
 
 // ── Auth commands ───────────────────────────────────────────
 
@@ -560,24 +671,28 @@ program.command('logout')
   })
 
 program.command('config')
-  .description('Show current config')
+  .description('Show current config (never prints stored tokens)')
   .action(() => {
-    const agent = getActiveAgent()
-    const token = getToken()
+    const player = getSelectedPlayer()
+    const stored = player ? getAgentProfiles()[player] : undefined
+    const rawToken = !!process.env.PROMPTED_TOKEN?.trim()
+    const token = getMainToken()
     const userId = getUserId()
-    let authMethod: 'agent' | 'token' | 'user_id' | 'none' = 'none'
-    if (agent) authMethod = 'agent'
+    let authMethod: 'raw_token' | 'player' | 'token' | 'user_id' | 'none' = 'none'
+    if (rawToken) authMethod = 'raw_token'
+    else if (player) authMethod = 'player'
     else if (token) authMethod = 'token'
     else if (userId) authMethod = 'user_id'
     output({
       server: getServer(),
-      hasToken: !!token,
+      hasToken: !!token || rawToken,
       authMethod,
-      identity: agent
-        ? { kind: 'agent', name: agent.name, id: agent.id }
-        : { kind: 'main', userId },
+      identity: player && !rawToken
+        ? { kind: 'lab_profile', name: player, id: stored?.id ?? null, hasStoredToken: !!stored }
+        : { kind: rawToken ? 'raw_token' : 'main', userId },
       userId,
-      storedAgents: Object.keys(getAgentProfiles()),
+      selectedPlayer: player,
+      storedLabProfiles: Object.keys(getAgentProfiles()),
     })
   })
 
@@ -610,12 +725,15 @@ program.command('signup')
   })
 
 program.command('me')
-  .description('Get current user info')
+  .description('Get current user info (acts as the selected --player when set)')
   .action(async () => {
+    await useLabProfile()
     output(await request('/api/me'))
   })
 
-// ── Agent commands (Lab mode) ───────────────────────────────
+// ── Advanced profile management commands ────────────────────
+// Normal play never needs these: `prompted --player <name> labmatch` resolves
+// and creates profiles automatically. These act as the main account.
 
 interface AgentListEntry {
   id: string
@@ -623,73 +741,42 @@ interface AgentListEntry {
   ownerUserId: string
   createdAt: string
   gamesPlayed: number
+  active?: boolean
   ratings: Array<{ gameType: string; rating: number; gamesPlayed: number; gamesWon: number }>
 }
 
-/** Resolve an agent name to its id, preferring the local profile store. */
+/** Resolve a Lab profile name to its id, preferring the local profile store. */
 async function resolveAgentId(name: string): Promise<string> {
   const local = getAgentProfiles()[name]
   if (local) return local.id
   const data = await request<{ agents: AgentListEntry[] }>('/api/agents')
   const match = data.agents.find((a) => a.name === name)
   if (!match) {
-    fail(`No agent named "${name}". Run \`prompted agent list\` to see your agents.`)
+    fail(`No Lab profile named "${name}". Run \`prompted agent list\` to see your profiles.`)
   }
   return match.id
 }
 
 const agentCmd = program.command('agent')
-  .description('Manage Lab agents (identities for Lab play)')
-
-agentCmd.command('create')
-  .description('Create a Lab agent (name is generated if omitted)')
-  .option('--name <name>', 'Agent name (any name; unique per owner)')
-  .action(async (opts) => {
-    forceMainIdentity = true
-    const body: Record<string, unknown> = {}
-    if (opts.name) body.name = opts.name
-    const data = await request<{ id: string; name: string; token: string }>('/api/agents', jsonBody(body))
-    const agents = getAgentProfiles()
-    agents[data.name] = { id: data.id, name: data.name, token: data.token }
-    setAgentProfiles(agents)
-    output({
-      ...data,
-      hint: `Token stored locally. Play as this agent with --as ${data.name}, PROMPTED_AGENT=${data.name}, or PROMPTED_TOKEN=<token> in a parallel process.`,
-    })
-  })
+  .description('Inspect and clean up Lab profiles (advanced; profiles are created automatically by play commands)')
 
 agentCmd.command('list')
-  .description('List your Lab agents with ratings and games played')
+  .description('List your Lab profiles with activity, ratings, and games played')
   .action(async () => {
-    forceMainIdentity = true
-    const data = await request<{ agents: AgentListEntry[] }>('/api/agents')
+    const data = await request<{ agents: AgentListEntry[]; totalProfiles?: number; activeCount?: number; activeLimit?: number }>('/api/agents')
     const stored = getAgentProfiles()
     output({
       agents: data.agents.map((a) => ({ ...a, hasStoredToken: !!stored[a.name] })),
+      totalProfiles: data.totalProfiles ?? data.agents.length,
+      activeCount: data.activeCount ?? 0,
+      activeLimit: data.activeLimit ?? null,
     })
   })
 
-agentCmd.command('token')
-  .description('Mint a fresh token for an agent and store it')
-  .argument('<name>', 'Agent name')
-  .action(async (name) => {
-    forceMainIdentity = true
-    const agentId = await resolveAgentId(name)
-    const data = await request<{ id: string; name: string; token: string }>(
-      `/api/agents/${encodeURIComponent(agentId)}/token`,
-      jsonBody({}),
-    )
-    const agents = getAgentProfiles()
-    agents[data.name] = { id: data.id, name: data.name, token: data.token }
-    setAgentProfiles(agents)
-    output({ ...data, hint: 'Token stored locally.' })
-  })
-
 agentCmd.command('remove')
-  .description('Revoke an agent (invalidates its tokens, frees a cap slot)')
-  .argument('<name>', 'Agent name')
+  .description('Revoke a Lab profile (invalidates its tokens; history is kept)')
+  .argument('<name>', 'Profile name')
   .action(async (name) => {
-    forceMainIdentity = true
     const agentId = await resolveAgentId(name)
     await request(`/api/agents/${encodeURIComponent(agentId)}`, { method: 'DELETE' })
     const agents = getAgentProfiles()
@@ -721,6 +808,7 @@ program.command('game')
   .argument('<id>', 'Game ID')
   .option('--format <format>', 'Output format: json (default) or text', 'json')
   .action(async (id, opts) => {
+    await useLabProfile()
     const safeId = validateId(id, 'game-id')
     const path = appendFormatParam(`/api/games/${safeId}`, opts.format)
     outputStateText(await request(path), opts.format)
@@ -731,6 +819,7 @@ program.command('events')
   .argument('<game-id>', 'Game ID')
   .option('--type <type>', 'Filter by event type')
   .action(async (gameId, opts) => {
+    await useLabProfile()
     const safeGameId = validateId(gameId, 'game-id')
     const qs = opts.type ? `?type=${encodeURIComponent(opts.type)}` : ''
     output(await request(`/api/games/${safeGameId}/events${qs}`))
@@ -761,9 +850,9 @@ program.command('leaderboard')
 // ── Game write commands ─────────────────────────────────────
 
 /**
- * Custom games are Lab games and require an agent identity; ranked
- * quickmatch requires the main account. Turn the server's 403 into a hint
- * about how to switch identity locally.
+ * Custom games are Lab games and require a Lab player; ranked play uses the
+ * main account. Turn the server's 403 into a hint about how to switch
+ * identity locally.
  */
 async function requestWithIdentityHint<T>(path: string, options: RequestInit): Promise<T> {
   const result = await requestMayFail<T>(path, options)
@@ -772,43 +861,45 @@ async function requestWithIdentityHint<T>(path: string, options: RequestInit): P
     fail('Authentication failed. Run `prompted login` to sign in again.')
   }
   if (result.status === 403) {
-    const hint = getActiveAgentName()
-      ? 'You are acting as an agent (via --as / PROMPTED_AGENT). Drop it to use your main account.'
-      : 'Lab play needs an agent identity: `prompted agent create`, then add --as <name> (or set PROMPTED_AGENT).'
+    const hint = getSelectedPlayer()
+      ? 'You are playing as a Lab player (via --player / PROMPTED_PLAYER). Drop it to use your main account.'
+      : 'Lab play needs a named player: add --player <name> or set PROMPTED_PLAYER=<name>; the profile is created automatically.'
     fail(`${result.error ?? 'Forbidden'} ${hint}`)
   }
   fail(result.error ?? `Request failed: ${result.status}`)
 }
 
 /**
- * Custom games are Lab games: fail before hitting the network when we can
- * tell locally that no agent identity is selected. A raw PROMPTED_TOKEN is
- * assumed to be an agent token (the documented way to run parallel agents);
- * the server gate is still authoritative either way.
+ * Custom games are Lab games: fail before hitting the network when no Lab
+ * player is selected. A raw PROMPTED_TOKEN is assumed to be a profile token
+ * (the documented way to run parallel players); the server gate is still
+ * authoritative either way.
  */
 function requireLabIdentity(): void {
-  if (getActiveAgentName() || process.env.PROMPTED_TOKEN?.trim()) return
+  if (getSelectedPlayer() || process.env.PROMPTED_TOKEN?.trim()) return
   fail(
-    'Custom games are Lab games and need an agent identity. ' +
-    'Create one with `prompted agent create`, then select it with --as <name> or PROMPTED_AGENT=<name> ' +
-    '(or run the process with PROMPTED_TOKEN=<agent-token>).'
+    'Custom games are Lab games and need a named player. ' +
+    'Add --player <name> or set PROMPTED_PLAYER=<name> (the profile is created automatically on first use), ' +
+    'or run the process with PROMPTED_TOKEN=<profile-token>.'
   )
 }
 
 program.command('create')
-  .description('Create a custom Lab game (unranked, requires an agent identity)')
+  .description('Create a custom Lab game (unranked, requires --player)')
   .requiredOption('--type <type>', 'Game type')
   .requiredOption('--max-players <n>', 'Max players', parseInt)
   .action(async (opts) => {
     requireLabIdentity()
+    await useLabProfile({ createIfMissing: true })
     output(await requestWithIdentityHint('/api/games', jsonBody({ type: opts.type, maxPlayers: opts.maxPlayers })))
   })
 
 program.command('join')
-  .description('Join a custom Lab game (unranked, requires an agent identity)')
+  .description('Join a custom Lab game (unranked, requires --player)')
   .argument('<game-id>', 'Game ID')
   .action(async (gameId) => {
     requireLabIdentity()
+    await useLabProfile({ createIfMissing: true })
     const safeGameId = validateId(gameId, 'game-id')
     output(await requestWithIdentityHint(`/api/games/${safeGameId}/join`, jsonBody({})))
   })
@@ -824,6 +915,7 @@ program.command('turn')
     } catch {
       fail('Invalid JSON in --action')
     }
+    await useLabProfile()
     const safeGameId = validateId(gameId, 'game-id')
     output(await request(`/api/games/${safeGameId}/turn`, withIdempotency({ action })))
   })
@@ -833,6 +925,7 @@ program.command('chat')
   .argument('<game-id>', 'Game ID')
   .requiredOption('--message <text>', 'Message text')
   .action(async (gameId, opts) => {
+    await useLabProfile()
     const safeGameId = validateId(gameId, 'game-id')
     output(await request(`/api/games/${safeGameId}/chat`, withIdempotency({ message: opts.message })))
   })
@@ -841,6 +934,7 @@ program.command('resign')
   .description('Resign from a game')
   .argument('<game-id>', 'Game ID')
   .action(async (gameId) => {
+    await useLabProfile()
     const safeGameId = validateId(gameId, 'game-id')
     output(await request(`/api/games/${safeGameId}/resign`, withIdempotency({})))
   })
@@ -854,6 +948,7 @@ program.command('wait')
   .option('--last-event-id <event-id>', 'Last event ID for conditional responses')
   .option('--format <format>', 'Output format: json (default) or text', 'json')
   .action(async (gameId, opts) => {
+    await useLabProfile()
     const safeGameId = validateId(gameId, 'game-id')
     let url = `/api/games/${safeGameId}/wait?since_event_id=${opts.since}`
     if (opts.lastEventId) url += `&last_event_id=${opts.lastEventId}`
@@ -865,6 +960,7 @@ program.command('wait-loop')
   .argument('<game-id>', 'Game ID')
   .option('--format <format>', 'Output format: text (default) or json', 'text')
   .action(async (gameId, opts) => {
+    await useLabProfile()
     const safeGameId = validateId(gameId, 'game-id')
     let cursor = 0
     let lastEventId: number | undefined
@@ -903,26 +999,39 @@ program.command('wait-loop')
 // ── Matchmaking commands ────────────────────────────────────
 
 program.command('queue')
-  .description('Join matchmaking queue (system picks the game)')
+  .description('Advanced: join a matchmaking queue without waiting. Effective identity: --player/PROMPTED_PLAYER for lab, main account for ranked.')
+  .requiredOption('--mode <mode>', 'Matchmaking pool: ranked or lab')
   .option('--type <type>', 'Vote for a game type (optional)')
   .addOption(new Option('--max-players <n>', '(deprecated)').hideHelp())
   .action(async (opts) => {
-    const body: Record<string, unknown> = {}
+    if (opts.mode !== 'ranked' && opts.mode !== 'lab') {
+      fail(`Invalid --mode "${opts.mode}". Use 'ranked' or 'lab'.`)
+    }
+    if (opts.mode === 'ranked' && getSelectedPlayer()) {
+      fail('Ranked queueing uses your main account. Drop --player / PROMPTED_PLAYER, or use --mode lab.')
+    }
+    if (opts.mode === 'lab' && !getSelectedPlayer() && !process.env.PROMPTED_TOKEN?.trim()) {
+      fail('Lab queueing needs a named player: add --player <name> or PROMPTED_PLAYER=<name> (or supply a raw PROMPTED_TOKEN profile token).')
+    }
+    if (opts.mode === 'lab') await useLabProfile({ createIfMissing: true })
+    const body: Record<string, unknown> = { mode: opts.mode }
     if (opts.type) body.gameType = opts.type
     output(await queueForMatch(body))
   })
 
 program.command('match-wait')
-  .description('Wait for matchmaking to complete (polls until matched)')
+  .description('Wait for matchmaking to complete (polls until matched). Uses the --player identity when set.')
   .argument('<queue-id>', 'Queue ID')
   .action(async (queueId) => {
+    await useLabProfile()
     await pollUntilMatched(queueId)
   })
 
 program.command('queue-cancel')
-  .description('Cancel matchmaking queue entry')
+  .description('Cancel matchmaking queue entry. Uses the --player identity when set.')
   .argument('<queue-id>', 'Queue ID')
   .action(async (queueId) => {
+    await useLabProfile()
     const safeQueueId = validateId(queueId, 'queue-id')
     output(await request(`/api/matchmaking/queue/${safeQueueId}`, { method: 'DELETE' }))
   })
@@ -1001,21 +1110,37 @@ async function pollUntilMatched(queueId: string): Promise<void> {
   }
 }
 
-program.command('quickmatch')
-  .description('Queue and wait until matched (system picks the game)')
+async function queueAndWait(body: Record<string, unknown>): Promise<void> {
+  const queueResult = await queueForMatch(body)
+
+  if (queueResult.matched && queueResult.gameId) {
+    output(queueResult)
+    return
+  }
+
+  await pollUntilMatched(queueResult.queueId)
+}
+
+program.command('rankedmatch')
+  .description('Find a ranked match as your main account and wait until matched')
   .option('--type <type>', 'Vote for a game type (optional)')
-  .addOption(new Option('--max-players <n>', '(deprecated)').hideHelp())
   .action(async (opts) => {
-    const body: Record<string, unknown> = {}
-    if (opts.type) body.gameType = opts.type
-    const queueResult = await queueForMatch(body)
-
-    if (queueResult.matched && queueResult.gameId) {
-      output(queueResult)
-      return
+    if (getSelectedPlayer()) {
+      fail('rankedmatch plays as your main account and cannot be combined with --player / PROMPTED_PLAYER. For Lab play, use `prompted --player <name> labmatch`.')
     }
+    const body: Record<string, unknown> = { mode: 'ranked' }
+    if (opts.type) body.gameType = opts.type
+    await queueAndWait(body)
+  })
 
-    await pollUntilMatched(queueResult.queueId)
+program.command('labmatch')
+  .description('Find a Lab match as a named player (--player <name>) and wait until matched')
+  .option('--type <type>', 'Vote for a game type (optional)')
+  .action(async (opts) => {
+    await useLabProfile({ createIfMissing: true, required: true })
+    const body: Record<string, unknown> = { mode: 'lab' }
+    if (opts.type) body.gameType = opts.type
+    await queueAndWait(body)
   })
 
 // ── Init command ────────────────────────────────────────────
@@ -1117,6 +1242,6 @@ program.command('init')
 
 // ── Run ─────────────────────────────────────────────────────
 
-program.parseAsync(process.argv).catch((err) => {
+program.parseAsync(extractPlayerFlag(process.argv)).catch((err) => {
   fail(err instanceof Error ? err.message : String(err))
 })
