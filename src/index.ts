@@ -18,7 +18,20 @@ import {
   COUP_MD,
   SKULL_MD,
   LIARS_DICE_MD,
+  CHESS_MD,
 } from './templates.js'
+
+const GAME_CATEGORIES = ['social', 'chess', 'poker'] as const
+type GameCategory = typeof GAME_CATEGORIES[number]
+const CATEGORY_GAME_TYPES: Record<GameCategory, readonly string[]> = {
+  social: ['coup', 'skull', 'secret-hitler', 'liars-dice'],
+  chess: ['chess'],
+  poker: ['texas-holdem'],
+}
+
+function categoryOf(gameType: string): GameCategory | null {
+  return GAME_CATEGORIES.find(category => CATEGORY_GAME_TYPES[category].includes(gameType)) ?? null
+}
 
 // ── Config ──────────────────────────────────────────────────
 
@@ -220,6 +233,7 @@ function outputStateText(data: unknown, format?: string) {
       if (obj.reason !== undefined) console.log(`reason: ${obj.reason}`)
       if (obj.nextSinceEventId !== undefined) console.log(`nextSinceEventId: ${obj.nextSinceEventId}`)
       if (obj.eventId !== undefined) console.log(`eventId: ${obj.eventId}`)
+      if (obj.timeRemaining !== undefined) console.log(`timeRemaining: ${obj.timeRemaining}s`)
       if (Array.isArray(obj.missedTurns) && obj.missedTurns.length > 0) {
         for (const mt of obj.missedTurns as Array<{ action: string; summary: string }>) {
           console.log(`WARNING: ${mt.summary}`)
@@ -420,8 +434,8 @@ async function queueForMatch(body: Record<string, unknown>): Promise<{ queueId: 
 
   if (result.status === 403) {
     const hint = getSelectedPlayer()
-      ? 'Lab players use `prompted --player <name> labmatch`; ranked play (`prompted rankedmatch`) uses your main account without --player.'
-      : 'Ranked play: `prompted rankedmatch`. Lab play: `prompted --player <name> labmatch`.'
+      ? 'This operation is not available to the selected Lab player.'
+      : 'Lab play uses a named player: `prompted --player <name> labmatch`.'
     fail(`${errorMsg || 'Forbidden'} ${hint}`)
   }
 
@@ -827,14 +841,24 @@ program.command('events')
 
 program.command('leaderboard')
   .description('Show leaderboard')
-  .option('--type <type>', 'Game type', 'texas-holdem')
-  .option('--mode <mode>', 'Ladder: ranked or lab', 'ranked')
+  .option('--type <type>', 'Game type')
+  .option('--category <category>', 'Lab category: social, chess, or poker')
+  .addOption(new Option('--mode <mode>', 'Ladder mode (advanced)').default('lab').hideHelp())
   .action(async (opts) => {
     if (opts.mode !== 'ranked' && opts.mode !== 'lab') {
       fail(`Invalid --mode "${opts.mode}". Use 'ranked' or 'lab'.`)
     }
+    if (opts.category && !GAME_CATEGORIES.includes(opts.category)) {
+      fail(`Invalid --category "${opts.category}". Use 'social', 'chess', or 'poker'.`)
+    }
+    if (opts.category && opts.type) {
+      fail('Use either --category or --type, not both.')
+    }
+    const params = new URLSearchParams({ mode: opts.mode })
+    if (opts.category) params.set('category', opts.category)
+    else params.set('type', opts.type ?? 'texas-holdem')
     const data = await request<{ leaderboard?: Array<Record<string, unknown>> }>(
-      `/api/leaderboard?type=${encodeURIComponent(opts.type)}&mode=${encodeURIComponent(opts.mode)}`
+      `/api/leaderboard?${params.toString()}`
     )
     // Lab agents have no globally unique names: render `mary <bobby>`.
     if (opts.mode === 'lab' && Array.isArray(data.leaderboard)) {
@@ -885,7 +909,7 @@ function requireLabIdentity(): void {
 }
 
 program.command('create')
-  .description('Create a custom Lab game (unranked, requires --player)')
+  .description('Create a custom Lab game (requires --player)')
   .requiredOption('--type <type>', 'Game type')
   .requiredOption('--max-players <n>', 'Max players', parseInt)
   .action(async (opts) => {
@@ -895,7 +919,7 @@ program.command('create')
   })
 
 program.command('join')
-  .description('Join a custom Lab game (unranked, requires --player)')
+  .description('Join a custom Lab game (requires --player)')
   .argument('<game-id>', 'Game ID')
   .action(async (gameId) => {
     requireLabIdentity()
@@ -999,9 +1023,10 @@ program.command('wait-loop')
 // ── Matchmaking commands ────────────────────────────────────
 
 program.command('queue')
-  .description('Advanced: join a matchmaking queue without waiting. Effective identity: --player/PROMPTED_PLAYER for lab, main account for ranked.')
-  .requiredOption('--mode <mode>', 'Matchmaking pool: ranked or lab')
+  .description('Advanced: join a matchmaking queue without waiting.')
+  .requiredOption('--mode <mode>', 'Matchmaking pool')
   .option('--type <type>', 'Vote for a game type (optional)')
+  .option('--category <category>', 'Lab category: social, chess, or poker')
   .addOption(new Option('--max-players <n>', '(deprecated)').hideHelp())
   .action(async (opts) => {
     if (opts.mode !== 'ranked' && opts.mode !== 'lab') {
@@ -1015,6 +1040,12 @@ program.command('queue')
     }
     if (opts.mode === 'lab') await useLabProfile({ createIfMissing: true })
     const body: Record<string, unknown> = { mode: opts.mode }
+    if (opts.category) {
+      if (!GAME_CATEGORIES.includes(opts.category)) {
+        fail(`Invalid --category "${opts.category}". Use 'social', 'chess', or 'poker'.`)
+      }
+      body.category = opts.category
+    }
     if (opts.type) body.gameType = opts.type
     output(await queueForMatch(body))
   })
@@ -1121,24 +1152,23 @@ async function queueAndWait(body: Record<string, unknown>): Promise<void> {
   await pollUntilMatched(queueResult.queueId)
 }
 
-program.command('rankedmatch')
-  .description('Find a ranked match as your main account and wait until matched')
-  .option('--type <type>', 'Vote for a game type (optional)')
-  .action(async (opts) => {
-    if (getSelectedPlayer()) {
-      fail('rankedmatch plays as your main account and cannot be combined with --player / PROMPTED_PLAYER. For Lab play, use `prompted --player <name> labmatch`.')
-    }
-    const body: Record<string, unknown> = { mode: 'ranked' }
-    if (opts.type) body.gameType = opts.type
-    await queueAndWait(body)
-  })
-
 program.command('labmatch')
   .description('Find a Lab match as a named player (--player <name>) and wait until matched')
+  .option('--chess', 'Join the Chess pool')
+  .option('--poker', 'Join the Poker pool')
   .option('--type <type>', 'Vote for a game type (optional)')
   .action(async (opts) => {
+    if (opts.chess && opts.poker) fail('Choose only one of --chess or --poker.')
+    const category: GameCategory = opts.chess
+      ? 'chess'
+      : opts.poker
+        ? 'poker'
+        : (opts.type ? categoryOf(opts.type) : null) ?? 'social'
+    if (opts.type && categoryOf(opts.type) !== category) {
+      fail(`Game type "${opts.type}" is not available in the ${category} category.`)
+    }
     await useLabProfile({ createIfMissing: true, required: true })
-    const body: Record<string, unknown> = { mode: 'lab' }
+    const body: Record<string, unknown> = { mode: 'lab', category }
     if (opts.type) body.gameType = opts.type
     await queueAndWait(body)
   })
@@ -1185,6 +1215,7 @@ program.command('init')
       'games/coup.md',
       'games/skull.md',
       'games/liars-dice.md',
+      'games/chess.md',
     ]
 
     console.log(`\nWe are going to scaffold an agent workspace in:\n  ${cwd}\n`)
@@ -1229,6 +1260,7 @@ program.command('init')
       ['coup.md', COUP_MD],
       ['skull.md', SKULL_MD],
       ['liars-dice.md', LIARS_DICE_MD],
+      ['chess.md', CHESS_MD],
     ]
 
     for (const [filename, content] of gameFiles) {

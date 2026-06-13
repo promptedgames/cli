@@ -53,9 +53,10 @@ describe('prompted CLI', () => {
 
   it('exposes the new command model in help output', () => {
     const out = run(['--help'])
-    for (const cmd of ['login', 'logout', 'signup', 'games', 'create', 'join', 'turn', 'wait', 'init', 'agent', 'rankedmatch', 'labmatch', '--player']) {
+    for (const cmd of ['login', 'logout', 'signup', 'games', 'create', 'join', 'turn', 'wait', 'init', 'agent', 'labmatch', '--player']) {
       expect(out).toContain(cmd)
     }
+    expect(out.toLowerCase()).not.toContain('ranked')
   })
 
   it('does not expose removed commands and options', () => {
@@ -80,10 +81,13 @@ describe('prompted CLI', () => {
     expect(stderr).toContain('--player')
   })
 
-  it('rejects rankedmatch combined with a selected Lab player (flag before and after)', () => {
-    expect(runFail(['--player', 'mary', 'rankedmatch'])).toContain('rankedmatch')
-    expect(runFail(['rankedmatch', '--player', 'mary'])).toContain('rankedmatch')
-    expect(runFail(['rankedmatch'], { PROMPTED_PLAYER: 'mary' })).toContain('rankedmatch')
+  it('does not register rankedmatch', () => {
+    expect(runFail(['rankedmatch'])).toContain('unknown command')
+  })
+
+  it('validates Lab category flags before queueing', () => {
+    expect(runFail(['--player', 'mary', 'labmatch', '--chess', '--poker'])).toContain('only one')
+    expect(runFail(['--player', 'mary', 'labmatch', '--chess', '--type', 'coup'])).toContain('not available')
   })
 
   it('rejects create without a player identity, without hitting the network', () => {
@@ -102,6 +106,10 @@ describe('prompted CLI', () => {
   it('rejects an invalid leaderboard --mode without hitting the network', () => {
     const stderr = runFail(['leaderboard', '--mode', 'bogus'])
     expect(stderr).toContain('Invalid --mode')
+  })
+
+  it('rejects an invalid leaderboard --category without hitting the network', () => {
+    expect(runFail(['leaderboard', '--category', 'unknown'])).toContain('Invalid --category')
   })
 })
 
@@ -324,28 +332,7 @@ describe('prompted CLI with mock server', () => {
     }
   })
 
-  it('rankedmatch uses the main token and sends mode: ranked', async () => {
-    const mock = await startMockServer((req, res) => {
-      if (req.url === '/api/matchmaking/queue') {
-        json(res, 200, { queueId: 'q1', matched: true, gameId: 'g1' })
-        return
-      }
-      json(res, 404, { error: 'not found' })
-    })
-    try {
-      await ok(['login', '--token', 'main-token'], env(mock.url))
-      const out = await ok(['rankedmatch', '--type', 'coup'], env(mock.url))
-      expect(out).toContain('"gameId":"g1"')
-      const queueReq = mock.requests.find((r) => r.url === '/api/matchmaking/queue')
-      expect(queueReq!.auth).toBe('Bearer main-token')
-      expect((queueReq!.body as { mode: string }).mode).toBe('ranked')
-      expect((queueReq!.body as { gameType: string }).gameType).toBe('coup')
-    } finally {
-      mock.server.close()
-    }
-  })
-
-  it('labmatch resolves the player and sends mode: lab; PROMPTED_PLAYER works like --player', async () => {
+  it('labmatch defaults to Social and resolves the player', async () => {
     const mock = await startMockServer((req, res) => {
       if (req.url === '/api/agents/resolve') {
         json(res, 201, { id: 'agent-1', name: 'mary', token: 'profile-token', created: true })
@@ -366,6 +353,46 @@ describe('prompted CLI with mock server', () => {
       const queueReq = mock.requests.find((r) => r.url === '/api/matchmaking/queue')
       expect(queueReq!.auth).toBe('Bearer profile-token')
       expect((queueReq!.body as { mode: string }).mode).toBe('lab')
+      expect((queueReq!.body as { category: string }).category).toBe('social')
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('labmatch --chess and --poker send their categories', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url === '/api/agents/resolve') {
+        json(res, 200, { id: 'agent-1', name: 'mary', token: 'profile-token', created: false })
+        return
+      }
+      if (req.url === '/api/matchmaking/queue') {
+        json(res, 200, { queueId: 'q1', matched: true, gameId: 'g1' })
+        return
+      }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      await ok(['login', '--token', 'main-token'], env(mock.url))
+      await ok(['--player', 'mary', 'labmatch', '--chess'], env(mock.url))
+      await ok(['--player', 'mary', 'labmatch', '--poker'], env(mock.url))
+      const queueRequests = mock.requests.filter((request) => request.url === '/api/matchmaking/queue')
+      expect(queueRequests.map(request => (request.body as { category: string }).category)).toEqual(['chess', 'poker'])
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('leaderboard --category requests the category ladder', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url === '/api/leaderboard?mode=lab&category=social') {
+        json(res, 200, { leaderboard: [], category: 'social', mode: 'lab' })
+        return
+      }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const result = await ok(['leaderboard', '--category', 'social'], env(mock.url))
+      expect(result).toContain('"category":"social"')
     } finally {
       mock.server.close()
     }
