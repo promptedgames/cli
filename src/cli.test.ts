@@ -53,10 +53,15 @@ describe('prompted CLI', () => {
 
   it('exposes the new command model in help output', () => {
     const out = run(['--help'])
-    for (const cmd of ['login', 'logout', 'signup', 'games', 'create', 'join', 'turn', 'wait', 'init', 'agent', 'labmatch', '--player']) {
+    for (const cmd of ['login', 'logout', 'games', 'create', 'join', 'turn', 'wait', 'init', 'agent', 'match', 'queue', '--player']) {
       expect(out).toContain(cmd)
     }
     expect(out.toLowerCase()).not.toContain('ranked')
+  })
+
+  it('hides dev-only signup from help (still runnable)', () => {
+    const out = run(['--help'])
+    expect(out).not.toMatch(/^\s*signup\b/m)
   })
 
   it('does not expose removed commands and options', () => {
@@ -64,6 +69,14 @@ describe('prompted CLI', () => {
     expect(out).not.toContain('quickmatch')
     expect(out).not.toContain('--as ')
     expect(out).not.toContain('PROMPTED_AGENT')
+    // Consolidated away: wait-loop -> wait --follow, events -> game --events,
+    // match-wait/queue-cancel -> queue --wait/--cancel, health -> config --check.
+    expect(out).not.toContain('wait-loop')
+    expect(out).not.toContain('match-wait')
+    expect(out).not.toContain('queue-cancel')
+    for (const cmd of ['wait-loop', 'match-wait', 'queue-cancel', 'events', 'health']) {
+      expect(runFail([cmd, 'x'])).toContain('unknown command')
+    }
     const agentOut = run(['agent', '--help'])
     expect(agentOut).not.toMatch(/^\s*create\b/m)
     expect(agentOut).not.toMatch(/^\s*token\b/m)
@@ -76,8 +89,8 @@ describe('prompted CLI', () => {
     }
   })
 
-  it('labmatch without a player fails before queueing', () => {
-    const stderr = runFail(['labmatch'])
+  it('match without a player fails before queueing', () => {
+    const stderr = runFail(['match'])
     expect(stderr).toContain('--player')
   })
 
@@ -86,8 +99,8 @@ describe('prompted CLI', () => {
   })
 
   it('validates Lab category flags before queueing', () => {
-    expect(runFail(['--player', 'mary', 'labmatch', '--chess', '--poker'])).toContain('only one')
-    expect(runFail(['--player', 'mary', 'labmatch', '--chess', '--type', 'coup'])).toContain('not available')
+    expect(runFail(['--player', 'mary', 'match', '--chess', '--poker'])).toContain('only one')
+    expect(runFail(['--player', 'mary', 'match', '--chess', '--type', 'coup'])).toContain('not available')
   })
 
   it('rejects create without a player identity, without hitting the network', () => {
@@ -96,11 +109,10 @@ describe('prompted CLI', () => {
     expect(stderr).toContain('--player')
   })
 
-  it('queue requires an explicit --mode and validates it', () => {
-    expect(runFail(['queue'])).toContain('--mode')
-    expect(runFail(['queue', '--mode', 'bogus'])).toContain('Invalid --mode')
-    expect(runFail(['queue', '--mode', 'ranked'], { PROMPTED_PLAYER: 'mary' })).toContain('main account')
-    expect(runFail(['queue', '--mode', 'lab'])).toContain('--player')
+  it('queue is Lab-only, needs a player, and validates category flags', () => {
+    expect(runFail(['queue'])).toContain('--player')
+    expect(runFail(['--player', 'mary', 'queue', '--chess', '--poker'])).toContain('only one')
+    expect(runFail(['--player', 'mary', 'queue', '--chess', '--type', 'coup'])).toContain('not available')
   })
 
   it('rejects an invalid leaderboard --mode without hitting the network', () => {
@@ -332,7 +344,7 @@ describe('prompted CLI with mock server', () => {
     }
   })
 
-  it('labmatch defaults to Social and resolves the player', async () => {
+  it('match defaults to Social and resolves the player', async () => {
     const mock = await startMockServer((req, res) => {
       if (req.url === '/api/agents/resolve') {
         json(res, 201, { id: 'agent-1', name: 'mary', token: 'profile-token', created: true })
@@ -346,7 +358,7 @@ describe('prompted CLI with mock server', () => {
     })
     try {
       await ok(['login', '--token', 'main-token'], env(mock.url))
-      const out = await ok(['labmatch'], env(mock.url, { PROMPTED_PLAYER: 'mary' }))
+      const out = await ok(['match'], env(mock.url, { PROMPTED_PLAYER: 'mary' }))
       expect(out).toContain('"gameId":"g1"')
       const resolveReq = mock.requests.find((r) => r.url === '/api/agents/resolve')
       expect((resolveReq!.body as { createIfMissing: boolean }).createIfMissing).toBe(true)
@@ -359,7 +371,7 @@ describe('prompted CLI with mock server', () => {
     }
   })
 
-  it('labmatch --chess and --poker send their categories', async () => {
+  it('match --chess and --poker send their categories', async () => {
     const mock = await startMockServer((req, res) => {
       if (req.url === '/api/agents/resolve') {
         json(res, 200, { id: 'agent-1', name: 'mary', token: 'profile-token', created: false })
@@ -373,8 +385,8 @@ describe('prompted CLI with mock server', () => {
     })
     try {
       await ok(['login', '--token', 'main-token'], env(mock.url))
-      await ok(['--player', 'mary', 'labmatch', '--chess'], env(mock.url))
-      await ok(['--player', 'mary', 'labmatch', '--poker'], env(mock.url))
+      await ok(['--player', 'mary', 'match', '--chess'], env(mock.url))
+      await ok(['--player', 'mary', 'match', '--poker'], env(mock.url))
       const queueRequests = mock.requests.filter((request) => request.url === '/api/matchmaking/queue')
       expect(queueRequests.map(request => (request.body as { category: string }).category)).toEqual(['chess', 'poker'])
     } finally {
@@ -407,7 +419,7 @@ describe('prompted CLI with mock server', () => {
       json(res, 404, { error: 'not found' })
     })
     try {
-      const out = await ok(['labmatch'], env(mock.url, { PROMPTED_TOKEN: 'raw-profile-token' }))
+      const out = await ok(['match'], env(mock.url, { PROMPTED_TOKEN: 'raw-profile-token' }))
       expect(out).toContain('"gameId":"g1"')
       expect(mock.requests.some((r) => r.url === '/api/agents/resolve')).toBe(false)
       const queueReq = mock.requests.find((r) => r.url === '/api/matchmaking/queue')

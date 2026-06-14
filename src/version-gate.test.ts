@@ -41,7 +41,7 @@ globalThis.fetch = async (_url, options = {}) => {
 }
 `, 'utf-8')
     try {
-      const result = runCli(['health', '--host', 'https://example.test'], mockFile, {
+      const result = runCli(['games', '--host', 'https://example.test'], mockFile, {
         MOCK_CAPTURE_FILE: captureFile,
       })
       const capture = JSON.parse(readFileSync(captureFile, 'utf-8')) as { userAgent: string }
@@ -70,7 +70,7 @@ globalThis.fetch = async () => {
 }
 `, 'utf-8')
     try {
-      const result = runCli(['health', '--host', 'https://example.test'], mockFile, { CI: '1' })
+      const result = runCli(['games', '--host', 'https://example.test'], mockFile, { CI: '1' })
       expect(result.status).toBe(1)
       expect(result.stderr).toContain('Minimum required: 0.1.1')
       expect(result.stderr).toContain('npm i -g @promptedgames/cli')

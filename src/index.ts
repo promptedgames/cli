@@ -169,7 +169,7 @@ async function resolveLabProfile(name: string, createIfMissing: boolean): Promis
 }
 
 interface UseLabProfileOptions {
-  /** Entry commands (labmatch, custom create/join) may create the profile. */
+  /** Entry commands (match, custom create/join) may create the profile. */
   createIfMissing?: boolean
   /** Fail when no player is selected (instead of falling back to the main account). */
   required?: boolean
@@ -435,7 +435,7 @@ async function queueForMatch(body: Record<string, unknown>): Promise<{ queueId: 
   if (result.status === 403) {
     const hint = getSelectedPlayer()
       ? 'This operation is not available to the selected Lab player.'
-      : 'Lab play uses a named player: `prompted --player <name> labmatch`.'
+      : 'Lab play uses a named player: `prompted --player <name> match`.'
     fail(`${errorMsg || 'Forbidden'} ${hint}`)
   }
 
@@ -685,8 +685,9 @@ program.command('logout')
   })
 
 program.command('config')
-  .description('Show current config (never prints stored tokens)')
-  .action(() => {
+  .description('Show current config (never prints stored tokens); --check also pings the server')
+  .option('--check', 'Also ping the server and include its health status')
+  .action(async (opts) => {
     const player = getSelectedPlayer()
     const stored = player ? getAgentProfiles()[player] : undefined
     const rawToken = !!process.env.PROMPTED_TOKEN?.trim()
@@ -697,7 +698,7 @@ program.command('config')
     else if (player) authMethod = 'player'
     else if (token) authMethod = 'token'
     else if (userId) authMethod = 'user_id'
-    output({
+    const info: Record<string, unknown> = {
       server: getServer(),
       hasToken: !!token || rawToken,
       authMethod,
@@ -707,20 +708,21 @@ program.command('config')
       userId,
       selectedPlayer: player,
       storedLabProfiles: Object.keys(getAgentProfiles()),
-    })
-  })
-
-program.command('health')
-  .description('Check server health')
-  .action(async () => {
-    const data = await request('/api/health')
-    output(data)
+    }
+    if (opts.check) {
+      try {
+        info.health = await request('/api/health')
+      } catch (err) {
+        info.health = { error: err instanceof Error ? err.message : String(err) }
+      }
+    }
+    output(info)
   })
 
 // ── User commands ───────────────────────────────────────────
 
-program.command('signup')
-  .description('Create a new user')
+program.command('signup', { hidden: true })
+  .description('Create a new user (dev/test servers only; real users sign in with `prompted login`)')
   .requiredOption('--name <name>', 'User name')
   .action(async (opts) => {
     const data = await request('/api/dev/signup', jsonBody({ name: opts.name }))
@@ -746,7 +748,7 @@ program.command('me')
   })
 
 // ── Advanced profile management commands ────────────────────
-// Normal play never needs these: `prompted --player <name> labmatch` resolves
+// Normal play never needs these: `prompted --player <name> match` resolves
 // and creates profiles automatically. These act as the main account.
 
 interface AgentListEntry {
@@ -818,25 +820,21 @@ program.command('games')
   })
 
 program.command('game')
-  .description('Get game details')
+  .description('Get game details (use --events to see the event log instead)')
   .argument('<id>', 'Game ID')
+  .option('--events', 'Show the game event log instead of the current state')
+  .option('--type <type>', 'With --events: filter by event type')
   .option('--format <format>', 'Output format: json (default) or text', 'json')
   .action(async (id, opts) => {
     await useLabProfile()
     const safeId = validateId(id, 'game-id')
+    if (opts.events) {
+      const qs = opts.type ? `?type=${encodeURIComponent(opts.type)}` : ''
+      output(await request(`/api/games/${safeId}/events${qs}`))
+      return
+    }
     const path = appendFormatParam(`/api/games/${safeId}`, opts.format)
     outputStateText(await request(path), opts.format)
-  })
-
-program.command('events')
-  .description('Get game events')
-  .argument('<game-id>', 'Game ID')
-  .option('--type <type>', 'Filter by event type')
-  .action(async (gameId, opts) => {
-    await useLabProfile()
-    const safeGameId = validateId(gameId, 'game-id')
-    const qs = opts.type ? `?type=${encodeURIComponent(opts.type)}` : ''
-    output(await request(`/api/games/${safeGameId}/events${qs}`))
   })
 
 program.command('leaderboard')
@@ -966,105 +964,95 @@ program.command('resign')
 // ── Wait commands ───────────────────────────────────────────
 
 program.command('wait')
-  .description('Long-poll for game updates')
+  .description('Long-poll for game updates; --follow streams continuously until the game ends')
   .argument('<game-id>', 'Game ID')
+  .option('-f, --follow', 'Stream updates continuously until the game ends (NDJSON)')
   .option('--since <event-id>', 'Since event ID', '0')
   .option('--last-event-id <event-id>', 'Last event ID for conditional responses')
-  .option('--format <format>', 'Output format: json (default) or text', 'json')
+  .option('--format <format>', 'Output format: json or text (default: text with --follow, json otherwise)')
   .action(async (gameId, opts) => {
     await useLabProfile()
     const safeGameId = validateId(gameId, 'game-id')
+
+    if (opts.follow) {
+      const format = opts.format ?? 'text'
+      let cursor = Number.parseInt(opts.since, 10) || 0
+      let lastEventId: number | undefined = opts.lastEventId ? Number.parseInt(opts.lastEventId, 10) : undefined
+      while (true) {
+        try {
+          let url = `/api/games/${safeGameId}/wait?since_event_id=${cursor}`
+          if (lastEventId !== undefined) url += `&last_event_id=${lastEventId}`
+          url = appendFormatParam(url, format)
+
+          const data = await request<{
+            reason: string
+            eventId: number
+            nextSinceEventId: number
+            gameStatus?: string
+            unchanged?: boolean
+            stateText?: string
+          }>(url)
+
+          cursor = data.nextSinceEventId
+          if (data.reason !== 'timeout') lastEventId = data.eventId
+          outputStateText(data, format)
+
+          if (
+            data.reason === 'game_over' ||
+            data.reason === 'eliminated' ||
+            data.reason === 'game_cancelled' ||
+            data.gameStatus === 'cancelled'
+          ) break
+        } catch {
+          // On 409 (concurrent wait), wait and retry
+          await new Promise(r => setTimeout(r, 2000))
+        }
+      }
+      return
+    }
+
+    const format = opts.format ?? 'json'
     let url = `/api/games/${safeGameId}/wait?since_event_id=${opts.since}`
     if (opts.lastEventId) url += `&last_event_id=${opts.lastEventId}`
-    outputStateText(await request(appendFormatParam(url, opts.format)), opts.format)
-  })
-
-program.command('wait-loop')
-  .description('Continuous wait loop (NDJSON output)')
-  .argument('<game-id>', 'Game ID')
-  .option('--format <format>', 'Output format: text (default) or json', 'text')
-  .action(async (gameId, opts) => {
-    await useLabProfile()
-    const safeGameId = validateId(gameId, 'game-id')
-    let cursor = 0
-    let lastEventId: number | undefined
-    while (true) {
-      try {
-        let url = `/api/games/${safeGameId}/wait?since_event_id=${cursor}`
-        if (lastEventId !== undefined) url += `&last_event_id=${lastEventId}`
-        url = appendFormatParam(url, opts.format)
-
-        const data = await request<{
-          reason: string
-          eventId: number
-          nextSinceEventId: number
-          gameStatus?: string
-          unchanged?: boolean
-          stateText?: string
-        }>(url)
-
-        cursor = data.nextSinceEventId
-        if (data.reason !== 'timeout') lastEventId = data.eventId
-        outputStateText(data, opts.format)
-
-        if (
-          data.reason === 'game_over' ||
-          data.reason === 'eliminated' ||
-          data.reason === 'game_cancelled' ||
-          data.gameStatus === 'cancelled'
-        ) break
-      } catch {
-        // On 409 (concurrent wait), wait and retry
-        await new Promise(r => setTimeout(r, 2000))
-      }
-    }
+    outputStateText(await request(appendFormatParam(url, format)), format)
   })
 
 // ── Matchmaking commands ────────────────────────────────────
 
 program.command('queue')
-  .description('Advanced: join a matchmaking queue without waiting.')
-  .requiredOption('--mode <mode>', 'Matchmaking pool')
+  .description('Advanced matchmaking: enqueue without waiting, or --wait / --cancel an entry. Lab only; needs --player.')
+  .option('--chess', 'Join the Chess pool')
+  .option('--poker', 'Join the Poker pool')
   .option('--type <type>', 'Vote for a game type (optional)')
-  .option('--category <category>', 'Lab category: social, chess, or poker')
-  .addOption(new Option('--max-players <n>', '(deprecated)').hideHelp())
+  .option('--wait <queue-id>', 'Resume waiting on an existing queue entry until matched')
+  .option('--cancel', 'Cancel your current matchmaking queue entry')
   .action(async (opts) => {
-    if (opts.mode !== 'ranked' && opts.mode !== 'lab') {
-      fail(`Invalid --mode "${opts.mode}". Use 'ranked' or 'lab'.`)
+    if (opts.cancel) {
+      await useLabProfile()
+      output(await request('/api/matchmaking/queue/me', { method: 'DELETE' }))
+      return
     }
-    if (opts.mode === 'ranked' && getSelectedPlayer()) {
-      fail('Ranked queueing uses your main account. Drop --player / PROMPTED_PLAYER, or use --mode lab.')
+    if (opts.wait) {
+      await useLabProfile()
+      await pollUntilMatched(validateId(opts.wait, 'queue-id'))
+      return
     }
-    if (opts.mode === 'lab' && !getSelectedPlayer() && !process.env.PROMPTED_TOKEN?.trim()) {
+    if (opts.chess && opts.poker) fail('Choose only one of --chess or --poker.')
+    if (!getSelectedPlayer() && !process.env.PROMPTED_TOKEN?.trim()) {
       fail('Lab queueing needs a named player: add --player <name> or PROMPTED_PLAYER=<name> (or supply a raw PROMPTED_TOKEN profile token).')
     }
-    if (opts.mode === 'lab') await useLabProfile({ createIfMissing: true })
-    const body: Record<string, unknown> = { mode: opts.mode }
-    if (opts.category) {
-      if (!GAME_CATEGORIES.includes(opts.category)) {
-        fail(`Invalid --category "${opts.category}". Use 'social', 'chess', or 'poker'.`)
-      }
-      body.category = opts.category
+    const category: GameCategory = opts.chess
+      ? 'chess'
+      : opts.poker
+        ? 'poker'
+        : (opts.type ? categoryOf(opts.type) : null) ?? 'social'
+    if (opts.type && categoryOf(opts.type) !== category) {
+      fail(`Game type "${opts.type}" is not available in the ${category} category.`)
     }
+    await useLabProfile({ createIfMissing: true })
+    const body: Record<string, unknown> = { mode: 'lab', category }
     if (opts.type) body.gameType = opts.type
     output(await queueForMatch(body))
-  })
-
-program.command('match-wait')
-  .description('Wait for matchmaking to complete (polls until matched). Uses the --player identity when set.')
-  .argument('<queue-id>', 'Queue ID')
-  .action(async (queueId) => {
-    await useLabProfile()
-    await pollUntilMatched(queueId)
-  })
-
-program.command('queue-cancel')
-  .description('Cancel matchmaking queue entry. Uses the --player identity when set.')
-  .argument('<queue-id>', 'Queue ID')
-  .action(async (queueId) => {
-    await useLabProfile()
-    const safeQueueId = validateId(queueId, 'queue-id')
-    output(await request(`/api/matchmaking/queue/${safeQueueId}`, { method: 'DELETE' }))
   })
 
 interface WaitResponse {
@@ -1152,8 +1140,8 @@ async function queueAndWait(body: Record<string, unknown>): Promise<void> {
   await pollUntilMatched(queueResult.queueId)
 }
 
-program.command('labmatch')
-  .description('Find a Lab match as a named player (--player <name>) and wait until matched')
+program.command('match')
+  .description('Find a Lab match as a named player (--player <name>) and play. Defaults to Social; --chess / --poker pick a pool.')
   .option('--chess', 'Join the Chess pool')
   .option('--poker', 'Join the Poker pool')
   .option('--type <type>', 'Vote for a game type (optional)')
@@ -1269,7 +1257,7 @@ program.command('init')
     }
 
     console.log('\nDone! Your agent workspace is ready.')
-    console.log('Run `prompted signup --name YourAgent` to get started.')
+    console.log('Sign in with `prompted login`, then play with `prompted --player <name> match`.')
   })
 
 // ── Run ─────────────────────────────────────────────────────
