@@ -247,6 +247,267 @@ function outputStateText(data: unknown, format?: string) {
   output(data)
 }
 
+type OutputFormat = 'json' | 'text'
+
+function validateOutputFormat(format: unknown): OutputFormat {
+  if (format === 'json' || format === 'text') return format
+  fail(`Invalid --format "${String(format)}". Use 'json' or 'text'.`)
+}
+
+function renderTextTable(headers: string[], rows: string[][]): string {
+  const widths = headers.map((header, column) =>
+    Math.max(header.length, ...rows.map(row => row[column]?.length ?? 0))
+  )
+  const renderRow = (row: string[]) =>
+    row.map((value, column) => value.padEnd(widths[column])).join('  ').trimEnd()
+
+  return [
+    renderRow(headers),
+    widths.map(width => '-'.repeat(width)).join('  '),
+    ...rows.map(renderRow),
+  ].join('\n')
+}
+
+function renderTextFields(fields: Array<[string, string]>): string {
+  const width = Math.max(...fields.map(([label]) => label.length))
+  return fields.map(([label, value]) => `${label.padEnd(width)}  ${value}`).join('\n')
+}
+
+function formatTimestamp(value: unknown): string {
+  if (typeof value !== 'string' || value.length === 0) return '-'
+  return value.replace('T', ' ').replace(/\.\d{3}Z$/, 'Z')
+}
+
+function formatPlayerName(player: { name?: string; ownerName?: string }): string {
+  if (!player.name) return 'unknown'
+  return player.ownerName ? `${player.name} <${player.ownerName}>` : player.name
+}
+
+interface GameListEntry {
+  id?: string
+  type?: string
+  mode?: string
+  status?: string
+  maxPlayers?: number
+  players?: Array<{ name?: string; ownerName?: string }>
+  createdAt?: string
+}
+
+function formatGamesText(data: { games?: GameListEntry[] }): string {
+  const games = data.games ?? []
+  if (games.length === 0) return 'No games found.'
+
+  const rows = games.map(game => [
+    game.id ?? '-',
+    game.type ?? '-',
+    game.mode ?? '-',
+    game.status ?? '-',
+    `${game.players?.length ?? 0}/${game.maxPlayers ?? '?'}`,
+    game.players?.map(formatPlayerName).join(', ') || '-',
+    formatTimestamp(game.createdAt),
+  ])
+  return renderTextTable(
+    ['ID', 'Type', 'Mode', 'Status', 'Players', 'Names', 'Created'],
+    rows,
+  )
+}
+
+interface GameEventEntry {
+  eventIndex?: number
+  type?: string
+  userName?: string | null
+  data?: Record<string, unknown>
+  createdAt?: string
+}
+
+function summarizeEventData(event: GameEventEntry): string {
+  const data = event.data
+  if (!data) return '-'
+  if (typeof data.message === 'string') return data.message
+  if (data.action !== undefined) return JSON.stringify(data.action)
+  if (event.type === 'join') {
+    const name = typeof data.name === 'string' ? data.name : event.userName
+    const seat = typeof data.seat === 'number' ? ` (seat ${data.seat})` : ''
+    return `${name ?? 'player'}${seat}`
+  }
+  if (event.type === 'game_start' && Array.isArray(data.players)) {
+    return `${data.players.length} players`
+  }
+  const { initialStateJson: _initialStateJson, ...summary } = data
+  return Object.keys(summary).length > 0 ? JSON.stringify(summary) : '-'
+}
+
+function formatEventsText(data: { events?: GameEventEntry[] }): string {
+  const events = data.events ?? []
+  if (events.length === 0) return 'No events found.'
+
+  return renderTextTable(
+    ['#', 'Time', 'Type', 'Player', 'Data'],
+    events.map(event => [
+      String(event.eventIndex ?? '-'),
+      formatTimestamp(event.createdAt),
+      event.type ?? '-',
+      event.userName ?? '-',
+      summarizeEventData(event),
+    ]),
+  )
+}
+
+interface AgentListEntry {
+  id: string
+  name: string
+  ownerUserId: string
+  createdAt: string
+  gamesPlayed: number
+  active?: boolean
+  activityType?: string | null
+  activityId?: string | null
+  hasStoredToken?: boolean
+  ratings: Array<{ gameType: string; rating: number; gamesPlayed: number; gamesWon: number }>
+}
+
+function formatActivity(active?: boolean, activityType?: string | null, activityId?: string | null): string {
+  if (!active) return 'idle'
+  const labels: Record<string, string> = {
+    queue: 'queued',
+    waiting_game: 'waiting game',
+    active_game: 'active game',
+  }
+  const label = activityType ? labels[activityType] ?? activityType : 'active'
+  return activityId ? `${label} ${activityId}` : label
+}
+
+function formatAgentListText(data: {
+  agents?: AgentListEntry[]
+  totalProfiles?: number
+  activeCount?: number
+  activeLimit?: number | null
+}): string {
+  const agents = data.agents ?? []
+  const active = data.activeCount ?? agents.filter(agent => agent.active).length
+  const limit = data.activeLimit == null ? '?' : data.activeLimit
+  const total = data.totalProfiles ?? agents.length
+  const title = `Lab profiles: ${total} total, ${active}/${limit} active`
+  if (agents.length === 0) return `${title}\nNo Lab profiles found.`
+
+  const rows = agents.map(agent => [
+    agent.name,
+    formatActivity(agent.active, agent.activityType, agent.activityId),
+    String(agent.gamesPlayed),
+    agent.ratings.map(rating =>
+      `${rating.gameType} ${rating.rating} (${rating.gamesWon}W/${rating.gamesPlayed}G)`
+    ).join(', ') || '-',
+    agent.hasStoredToken ? 'yes' : 'no',
+  ])
+  return `${title}\n${renderTextTable(['Name', 'Activity', 'Games', 'Ratings', 'Stored token'], rows)}`
+}
+
+interface MeResponse {
+  id?: string
+  name?: string
+  kind?: string
+  ownerUserId?: string
+  isAdmin?: boolean
+  createdAt?: string
+  agentActive?: boolean
+  labActivity?: {
+    activeCount?: number
+    limit?: number
+    profiles?: Array<{
+      id?: string
+      name?: string
+      active?: boolean
+      activityType?: string | null
+      activityId?: string | null
+    }>
+  }
+}
+
+function formatMeText(data: MeResponse): string {
+  const fields: Array<[string, string]> = [
+    ['Name', data.name ?? '-'],
+    ['ID', data.id ?? '-'],
+    ['Kind', data.kind ?? '-'],
+    ['Active', data.agentActive ? 'yes' : 'no'],
+    ['Created', formatTimestamp(data.createdAt)],
+  ]
+  if (data.ownerUserId) fields.push(['Owner ID', data.ownerUserId])
+  if (data.isAdmin) fields.push(['Admin', 'yes'])
+  if (data.labActivity) {
+    fields.push([
+      'Lab activity',
+      `${data.labActivity.activeCount ?? 0}/${data.labActivity.limit ?? '?'}`,
+    ])
+  }
+
+  const profiles = data.labActivity?.profiles ?? []
+  if (profiles.length === 0) return renderTextFields(fields)
+  const profileRows = profiles.map(profile => [
+    profile.name ?? '-',
+    formatActivity(profile.active, profile.activityType, profile.activityId),
+  ])
+  return `${renderTextFields(fields)}\n\n${renderTextTable(['Lab profile', 'Activity'], profileRows)}`
+}
+
+function formatConfigText(data: Record<string, unknown>): string {
+  const identity = typeof data.identity === 'object' && data.identity !== null
+    ? data.identity as Record<string, unknown>
+    : {}
+  const fields: Array<[string, string]> = [
+    ['Server', String(data.server ?? '-')],
+    ['Auth', String(data.authMethod ?? 'none')],
+    ['Identity', String(identity.kind ?? '-')],
+    ['User ID', String(data.userId ?? identity.userId ?? '-')],
+    ['Selected player', String(data.selectedPlayer ?? '-')],
+    [
+      'Stored profiles',
+      Array.isArray(data.storedLabProfiles) && data.storedLabProfiles.length > 0
+        ? data.storedLabProfiles.join(', ')
+        : '-',
+    ],
+  ]
+  if (data.health !== undefined) {
+    const health = typeof data.health === 'object' && data.health !== null
+      ? data.health as Record<string, unknown>
+      : {}
+    fields.push(['Health', String(health.status ?? health.error ?? JSON.stringify(data.health))])
+  }
+  return renderTextFields(fields)
+}
+
+interface LeaderboardEntry {
+  name?: string
+  ownerName?: string
+  display?: string
+  rating?: number
+  gamesPlayed?: number
+  gamesWon?: number
+  completionRate?: number | null
+}
+
+function formatLeaderboardText(data: {
+  leaderboard?: LeaderboardEntry[]
+  gameType?: string
+  category?: string
+  mode?: string
+}): string {
+  const entries = data.leaderboard ?? []
+  const ladder = data.category ?? data.gameType ?? 'leaderboard'
+  const title = `${ladder} (${data.mode ?? 'lab'})`
+  if (entries.length === 0) return `${title}\nNo players ranked yet.`
+
+  const rows = entries.map((entry, index) => [
+    String(index + 1),
+    entry.display ?? entry.name ?? 'unknown',
+    String(entry.rating ?? '-'),
+    String(entry.gamesPlayed ?? '-'),
+    String(entry.gamesWon ?? '-'),
+    entry.completionRate == null ? '-' : `${Math.round(entry.completionRate * 100)}%`,
+  ])
+  const headers = ['#', 'Player', 'Rating', 'Games', 'Wins', 'Completion']
+  return `${title}\n${renderTextTable(headers, rows)}`
+}
+
 function fail(message: string, exitCode = 1): never {
   console.error(JSON.stringify({ error: message }))
   process.exit(exitCode)
@@ -687,7 +948,9 @@ program.command('logout')
 program.command('config')
   .description('Show current config (never prints stored tokens); --check also pings the server')
   .option('--check', 'Also ping the server and include its health status')
+  .option('--format <format>', 'Output format: json (default) or text', 'json')
   .action(async (opts) => {
+    const format = validateOutputFormat(opts.format)
     const player = getSelectedPlayer()
     const stored = player ? getAgentProfiles()[player] : undefined
     const rawToken = !!process.env.PROMPTED_TOKEN?.trim()
@@ -716,7 +979,8 @@ program.command('config')
         info.health = { error: err instanceof Error ? err.message : String(err) }
       }
     }
-    output(info)
+    if (format === 'text') console.log(formatConfigText(info))
+    else output(info)
   })
 
 // ── User commands ───────────────────────────────────────────
@@ -742,24 +1006,18 @@ program.command('signup', { hidden: true })
 
 program.command('me')
   .description('Get current user info (acts as the selected --player when set)')
-  .action(async () => {
+  .option('--format <format>', 'Output format: json (default) or text', 'json')
+  .action(async (opts) => {
+    const format = validateOutputFormat(opts.format)
     await useLabProfile()
-    output(await request('/api/me'))
+    const data = await request<MeResponse>('/api/me')
+    if (format === 'text') console.log(formatMeText(data))
+    else output(data)
   })
 
 // ── Advanced profile management commands ────────────────────
 // Normal play never needs these: `prompted --player <name> match` resolves
 // and creates profiles automatically. These act as the main account.
-
-interface AgentListEntry {
-  id: string
-  name: string
-  ownerUserId: string
-  createdAt: string
-  gamesPlayed: number
-  active?: boolean
-  ratings: Array<{ gameType: string; rating: number; gamesPlayed: number; gamesWon: number }>
-}
 
 /** Resolve a Lab profile name to its id, preferring the local profile store. */
 async function resolveAgentId(name: string): Promise<string> {
@@ -778,15 +1036,19 @@ const agentCmd = program.command('agent')
 
 agentCmd.command('list')
   .description('List your Lab profiles with activity, ratings, and games played')
-  .action(async () => {
+  .option('--format <format>', 'Output format: json (default) or text', 'json')
+  .action(async (opts) => {
+    const format = validateOutputFormat(opts.format)
     const data = await request<{ agents: AgentListEntry[]; totalProfiles?: number; activeCount?: number; activeLimit?: number }>('/api/agents')
     const stored = getAgentProfiles()
-    output({
+    const result = {
       agents: data.agents.map((a) => ({ ...a, hasStoredToken: !!stored[a.name] })),
       totalProfiles: data.totalProfiles ?? data.agents.length,
       activeCount: data.activeCount ?? 0,
       activeLimit: data.activeLimit ?? null,
-    })
+    }
+    if (format === 'text') console.log(formatAgentListText(result))
+    else output(result)
   })
 
 agentCmd.command('remove')
@@ -807,7 +1069,9 @@ program.command('games')
   .description('List games')
   .option('--type <type>', 'Filter by game type')
   .option('--status <status>', 'Filter by status')
+  .option('--format <format>', 'Output format: json (default) or text', 'json')
   .action(async (opts) => {
+    const format = validateOutputFormat(opts.format)
     const validStatuses = ['waiting', 'active', 'finished', 'cancelled', 'aborted']
     if (opts.status && !validStatuses.includes(opts.status)) {
       console.error(`Warning: unknown status "${opts.status}". Valid values: ${validStatuses.join(', ')}`)
@@ -816,7 +1080,9 @@ program.command('games')
     if (opts.type) params.set('type', opts.type)
     if (opts.status) params.set('status', opts.status)
     const qs = params.toString()
-    output(await request(`/api/games${qs ? '?' + qs : ''}`))
+    const data = await request<{ games?: GameListEntry[] }>(`/api/games${qs ? '?' + qs : ''}`)
+    if (format === 'text') console.log(formatGamesText(data))
+    else output(data)
   })
 
 program.command('game')
@@ -826,23 +1092,28 @@ program.command('game')
   .option('--type <type>', 'With --events: filter by event type')
   .option('--format <format>', 'Output format: json (default) or text', 'json')
   .action(async (id, opts) => {
+    const format = validateOutputFormat(opts.format)
     await useLabProfile()
     const safeId = validateId(id, 'game-id')
     if (opts.events) {
       const qs = opts.type ? `?type=${encodeURIComponent(opts.type)}` : ''
-      output(await request(`/api/games/${safeId}/events${qs}`))
+      const data = await request<{ events?: GameEventEntry[] }>(`/api/games/${safeId}/events${qs}`)
+      if (format === 'text') console.log(formatEventsText(data))
+      else output(data)
       return
     }
-    const path = appendFormatParam(`/api/games/${safeId}`, opts.format)
-    outputStateText(await request(path), opts.format)
+    const path = appendFormatParam(`/api/games/${safeId}`, format)
+    outputStateText(await request(path), format)
   })
 
 program.command('leaderboard')
   .description('Show leaderboard')
   .option('--type <type>', 'Game type')
   .option('--category <category>', 'Lab category: social, chess, or poker')
+  .option('--format <format>', 'Output format: json (default) or text', 'json')
   .addOption(new Option('--mode <mode>', 'Ladder mode (advanced)').default('lab').hideHelp())
   .action(async (opts) => {
+    const format = validateOutputFormat(opts.format)
     if (opts.mode !== 'ranked' && opts.mode !== 'lab') {
       fail(`Invalid --mode "${opts.mode}". Use 'ranked' or 'lab'.`)
     }
@@ -855,7 +1126,12 @@ program.command('leaderboard')
     const params = new URLSearchParams({ mode: opts.mode })
     if (opts.category) params.set('category', opts.category)
     else params.set('type', opts.type ?? 'texas-holdem')
-    const data = await request<{ leaderboard?: Array<Record<string, unknown>> }>(
+    const data = await request<{
+      leaderboard?: LeaderboardEntry[]
+      gameType?: string
+      category?: string
+      mode?: string
+    }>(
       `/api/leaderboard?${params.toString()}`
     )
     // Lab agents have no globally unique names: render `mary <bobby>`.
@@ -866,7 +1142,11 @@ program.command('leaderboard')
         }
       }
     }
-    output(data)
+    if (format === 'text') {
+      console.log(formatLeaderboardText(data))
+    } else {
+      output(data)
+    }
   })
 
 // ── Game write commands ─────────────────────────────────────
@@ -971,11 +1251,11 @@ program.command('wait')
   .option('--last-event-id <event-id>', 'Last event ID for conditional responses')
   .option('--format <format>', 'Output format: json or text (default: text with --follow, json otherwise)')
   .action(async (gameId, opts) => {
+    const format = validateOutputFormat(opts.format ?? (opts.follow ? 'text' : 'json'))
     await useLabProfile()
     const safeGameId = validateId(gameId, 'game-id')
 
     if (opts.follow) {
-      const format = opts.format ?? 'text'
       let cursor = Number.parseInt(opts.since, 10) || 0
       let lastEventId: number | undefined = opts.lastEventId ? Number.parseInt(opts.lastEventId, 10) : undefined
       while (true) {
@@ -1011,7 +1291,6 @@ program.command('wait')
       return
     }
 
-    const format = opts.format ?? 'json'
     let url = `/api/games/${safeGameId}/wait?since_event_id=${opts.since}`
     if (opts.lastEventId) url += `&last_event_id=${opts.lastEventId}`
     outputStateText(await request(appendFormatParam(url, format)), format)
@@ -1019,7 +1298,7 @@ program.command('wait')
 
 // ── Matchmaking commands ────────────────────────────────────
 
-program.command('queue')
+program.command('queue', { hidden: true })
   .description('Advanced matchmaking: enqueue without waiting, or --wait / --cancel an entry. Lab only; needs --player.')
   .option('--chess', 'Join the Chess pool')
   .option('--poker', 'Join the Poker pool')

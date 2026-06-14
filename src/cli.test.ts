@@ -53,9 +53,10 @@ describe('prompted CLI', () => {
 
   it('exposes the new command model in help output', () => {
     const out = run(['--help'])
-    for (const cmd of ['login', 'logout', 'games', 'create', 'join', 'turn', 'wait', 'init', 'agent', 'match', 'queue', '--player']) {
+    for (const cmd of ['login', 'logout', 'games', 'create', 'join', 'turn', 'wait', 'init', 'agent', 'match', '--player']) {
       expect(out).toContain(cmd)
     }
+    expect(out).not.toMatch(/^\s*queue\b/m)
     expect(out.toLowerCase()).not.toContain('ranked')
   })
 
@@ -122,6 +123,10 @@ describe('prompted CLI', () => {
 
   it('rejects an invalid leaderboard --category without hitting the network', () => {
     expect(runFail(['leaderboard', '--category', 'unknown'])).toContain('Invalid --category')
+  })
+
+  it('rejects an invalid leaderboard --format without hitting the network', () => {
+    expect(runFail(['leaderboard', '--format', 'yaml'])).toContain('Invalid --format')
   })
 })
 
@@ -410,6 +415,146 @@ describe('prompted CLI with mock server', () => {
     }
   })
 
+  it('leaderboard --format text renders a readable table', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url === '/api/leaderboard?mode=lab&type=texas-holdem') {
+        json(res, 200, {
+          leaderboard: [{
+            name: 'hughmann',
+            ownerName: 'Faltum',
+            rating: 1205,
+            gamesPlayed: 1,
+            gamesWon: 1,
+            completionRate: 1,
+          }],
+          gameType: 'texas-holdem',
+          mode: 'lab',
+        })
+        return
+      }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const result = await ok(['leaderboard', '--format', 'text'], env(mock.url))
+      expect(result).toContain('texas-holdem (lab)')
+      expect(result).toContain('Player')
+      expect(result).toContain('hughmann <Faltum>')
+      expect(result).toContain('1205')
+      expect(result).toContain('100%')
+      expect(result).not.toContain('"leaderboard"')
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('read commands render useful --format text output', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url === '/api/games') {
+        json(res, 200, {
+          games: [{
+            id: 'g1',
+            type: 'coup',
+            mode: 'lab',
+            status: 'active',
+            maxPlayers: 4,
+            players: [
+              { name: 'mary', ownerName: 'Faltum' },
+              { name: 'basho', ownerName: 'Faltum' },
+            ],
+            createdAt: '2026-06-14T12:30:00.000Z',
+          }],
+        })
+        return
+      }
+      if (req.url === '/api/me') {
+        json(res, 200, {
+          id: 'u1',
+          name: 'Faltum',
+          kind: 'standard',
+          createdAt: '2026-06-01T10:00:00.000Z',
+          agentActive: false,
+          labActivity: {
+            activeCount: 1,
+            limit: 4,
+            profiles: [{
+              id: 'p1',
+              name: 'mary',
+              active: true,
+              activityType: 'active_game',
+              activityId: 'g1',
+            }],
+          },
+        })
+        return
+      }
+      if (req.url === '/api/agents') {
+        json(res, 200, {
+          agents: [{
+            id: 'p1',
+            name: 'mary',
+            ownerUserId: 'u1',
+            createdAt: '2026-06-01T10:00:00.000Z',
+            active: true,
+            activityType: 'active_game',
+            activityId: 'g1',
+            gamesPlayed: 3,
+            ratings: [{
+              gameType: 'coup',
+              rating: 1210,
+              gamesPlayed: 3,
+              gamesWon: 2,
+            }],
+          }],
+          totalProfiles: 1,
+          activeCount: 1,
+          activeLimit: 4,
+        })
+        return
+      }
+      if (req.url === '/api/games/g1/events') {
+        json(res, 200, {
+          events: [{
+            eventIndex: 1,
+            type: 'game_start',
+            userName: null,
+            data: {
+              players: [{ name: 'mary' }, { name: 'basho' }],
+              initialStateJson: 'large-secret-state',
+            },
+            createdAt: '2026-06-14T12:31:00.000Z',
+          }],
+        })
+        return
+      }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      await ok(['login', '--token', 'main-token'], env(mock.url))
+
+      const games = await ok(['games', '--format', 'text'], env(mock.url))
+      expect(games).toContain('g1')
+      expect(games).toContain('mary <Faltum>, basho <Faltum>')
+      expect(games).toContain('2/4')
+
+      const me = await ok(['me', '--format', 'text'], env(mock.url))
+      expect(me).toContain('Faltum')
+      expect(me).toContain('Lab activity')
+      expect(me).toContain('1/4')
+      expect(me).toContain('active game g1')
+
+      const agents = await ok(['agent', 'list', '--format', 'text'], env(mock.url))
+      expect(agents).toContain('Lab profiles: 1 total, 1/4 active')
+      expect(agents).toContain('coup 1210 (2W/3G)')
+
+      const events = await ok(['game', 'g1', '--events', '--format', 'text'], env(mock.url))
+      expect(events).toContain('game_start')
+      expect(events).toContain('2 players')
+      expect(events).not.toContain('large-secret-state')
+    } finally {
+      mock.server.close()
+    }
+  })
+
   it('a raw PROMPTED_TOKEN bypasses profile resolution', async () => {
     const mock = await startMockServer((req, res) => {
       if (req.url === '/api/matchmaking/queue') {
@@ -450,6 +595,12 @@ describe('prompted CLI with mock server', () => {
       expect(parsed.storedLabProfiles).toContain('mary')
       expect(out).not.toContain('secret-profile-token')
       expect(out).not.toContain('secret-main-token')
+
+      const text = await ok(['config', '--player', 'mary', '--format', 'text'], env(mock.url))
+      expect(text).toContain('Selected player  mary')
+      expect(text).toContain('Stored profiles  mary')
+      expect(text).not.toContain('secret-profile-token')
+      expect(text).not.toContain('secret-main-token')
     } finally {
       mock.server.close()
     }
