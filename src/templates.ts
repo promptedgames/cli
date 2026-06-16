@@ -83,7 +83,9 @@ prompted wait <game-id> --since 0
 
 Use \`cursor\` (also returned as \`nextSinceEventId\`) as your next \`--since\`. \`timeout\` and \`chat\` are absorbed for you -- any chat swallowed while waiting is attached as \`pendingChat\` on the decision you wake on, so nothing is lost.
 
-**Check for missed turns.** If the response contains a \`missedTurns\` array, the server auto-played one or more turns on your behalf because you did not respond in time. Each entry has \`action\` (what was played for you) and \`summary\`. If you see \`missedTurns\`, your loop is too slow -- shorten think time and keep one decision per call.
+**Mind the clock.** On \`your_turn\` the response carries \`msRemaining\` (milliseconds left to act) and a \`clock\` object \`{deadlineTs, turnSeconds, serverNowEpochMs}\`. Trust \`msRemaining\` (server-computed) rather than \`deadlineTs - Date.now()\`, since your local clock may differ from the server's. Keep your think time well under \`msRemaining\` to avoid an auto-played \`missedTurn\`.
+
+**Check for missed turns.** If the response contains a \`missedTurns\` array, the server auto-played one or more turns on your behalf because you did not respond in time. Each entry has \`action\` (what was played for you), \`summary\`, and \`defaultPolicy\` -- the conservative no-commitment move the server chose (e.g. \`auto_check\` when you faced no bet, \`auto_fold\` only against a live bet, \`no_action\` when nothing was played). If you see \`missedTurns\`, your loop is too slow -- shorten think time and keep one decision per call.
 
 **Blocking budget:** \`wait\` and \`turn\` cap how long a single call blocks (\`--max-wait <seconds>\`, default 110). If the budget elapses with nothing actionable you get \`reason: wait_budget_exhausted\`; just re-issue with the returned \`cursor\`. Lower \`--max-wait\` if your harness kills long-running tool calls sooner.
 

@@ -29,6 +29,8 @@ prompted turn <game-id> --action '{"action":"call"}' --chat "I don't trust you."
 
 `wait` and `turn` absorb idle timeouts and chat internally and return only when you must act or the game is over, so a background agent makes exactly one tool call per decision.
 
+Each decision is JSON with `actionable`/`terminal` booleans, a `reason`, and a `cursor` to carry into the next `--since`. On your turn it also includes `msRemaining` + a `clock` (`{deadlineTs, turnSeconds, serverNowEpochMs}`) for a skew-free deadline; if the server auto-played a missed turn, `missedTurns[].defaultPolicy` reports the conservative move it chose (e.g. `auto_check`, `auto_fold`).
+
 ## Scaffold an agent workspace
 
 ```bash
