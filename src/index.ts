@@ -74,7 +74,13 @@ interface AgentProfile {
 // from argv up front. `--player` is global player selection and deliberately
 // distinct from `signup --name <account-name>`.
 let selectedPlayerFromArgv: string | null = null
-function extractPlayerFlag(argv: string[]): string[] {
+let verboseFromArgv = false
+let idempotencyKeyOverride: string | null = null
+
+// Global flags accepted anywhere in argv (Commander only parses program-level
+// options *before* the subcommand). `--player`, `--verbose`, and
+// `--idempotency-key` are extracted up front so they work in any position.
+function extractGlobalFlags(argv: string[]): string[] {
   const out: string[] = []
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
@@ -89,9 +95,34 @@ function extractPlayerFlag(argv: string[]): string[] {
       selectedPlayerFromArgv = arg.slice('--player='.length)
       continue
     }
+    if (arg === '--verbose') {
+      verboseFromArgv = true
+      continue
+    }
+    if (arg === '--idempotency-key') {
+      const value = argv[i + 1]
+      if (!value || value.startsWith('-')) fail('--idempotency-key requires a value')
+      idempotencyKeyOverride = value
+      i++
+      continue
+    }
+    if (arg.startsWith('--idempotency-key=')) {
+      idempotencyKeyOverride = arg.slice('--idempotency-key='.length)
+      continue
+    }
     out.push(arg)
   }
   return out
+}
+
+function isVerbose(): boolean {
+  return verboseFromArgv || /^(debug|trace)$/i.test(process.env.PROMPTED_LOG ?? '')
+}
+
+/** One NDJSON line per logged event to stderr; stdout stays machine-clean. */
+function logDebug(event: Record<string, unknown>): void {
+  if (!isVerbose()) return
+  console.error(JSON.stringify({ ts: new Date().toISOString(), ...event }))
 }
 
 function getAgentProfiles(): Record<string, AgentProfile> {
@@ -602,7 +633,9 @@ async function request<T>(path: string, options?: RequestInit, isRetry = false):
     headers['X-User-Id'] = userId
   }
 
+  const started = Date.now()
   const res = await fetch(url, { ...options, headers })
+  logDebug({ method: options?.method ?? 'GET', url: path, status: res.status, ms: Date.now() - started })
   let body: unknown
   try {
     body = await res.json()
@@ -629,7 +662,25 @@ async function request<T>(path: string, options?: RequestInit, isRetry = false):
   return body as T
 }
 
-async function requestMayFail<T>(path: string, options?: RequestInit, isRetry = false): Promise<{ ok: boolean; status: number; data: T | null; error?: string }> {
+interface MayFailResult<T> {
+  ok: boolean
+  status: number
+  data: T | null
+  error?: string
+  /** Parsed from the `Retry-After` header, when present (429/503). */
+  retryAfterMs?: number
+}
+
+function parseRetryAfter(header: string | null): number | undefined {
+  if (!header) return undefined
+  const seconds = Number(header)
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000)
+  const date = Date.parse(header)
+  if (!Number.isNaN(date)) return Math.max(0, date - Date.now())
+  return undefined
+}
+
+async function requestMayFail<T>(path: string, options?: RequestInit, isRetry = false): Promise<MayFailResult<T>> {
   const url = `${getServer()}${path}`
   const token = getToken()
   const userId = getUserId()
@@ -643,7 +694,17 @@ async function requestMayFail<T>(path: string, options?: RequestInit, isRetry = 
     headers['X-User-Id'] = userId
   }
 
-  const res = await fetch(url, { ...options, headers })
+  // status 0 signals a network-level failure (DNS, refused, reset) so callers
+  // can treat it as transient and back off rather than crash.
+  const started = Date.now()
+  let res: Response
+  try {
+    res = await fetch(url, { ...options, headers })
+  } catch (err) {
+    logDebug({ method: options?.method ?? 'GET', url: path, status: 0, error: err instanceof Error ? err.message : String(err), ms: Date.now() - started })
+    return { ok: false, status: 0, data: null, error: err instanceof Error ? err.message : 'network error' }
+  }
+  logDebug({ method: options?.method ?? 'GET', url: path, status: res.status, ms: Date.now() - started })
   let body: unknown
   try {
     body = await res.json()
@@ -658,7 +719,7 @@ async function requestMayFail<T>(path: string, options?: RequestInit, isRetry = 
       return requestMayFail(path, options, true)
     }
     const msg = (body as { error?: string } | null)?.error ?? `Request failed: ${res.status}`
-    return { ok: false, status: res.status, data: body as T, error: msg }
+    return { ok: false, status: res.status, data: body as T, error: msg, retryAfterMs: parseRetryAfter(res.headers.get('retry-after')) }
   }
 
   return { ok: true, status: res.status, data: body as T }
@@ -781,14 +842,250 @@ function jsonBody(data: unknown): { method: string; headers: Record<string, stri
   }
 }
 
-function withIdempotency(data: unknown): RequestInit {
+/**
+ * Idempotency key for a write. A content-derived key makes a retry — even from
+ * a restarted process — land on the same server-side result instead of
+ * creating a duplicate. `--idempotency-key` overrides it. Pass `null` parts to
+ * fall back to a random key (for writes like chat where two identical payloads
+ * are legitimately distinct and must NOT be deduped).
+ */
+function idempotencyKeyFor(parts: Array<string | number> | null): string {
+  if (idempotencyKeyOverride) return idempotencyKeyOverride
+  if (parts === null) return crypto.randomUUID()
+  const profile = activeProfile?.id ?? getUserId() ?? 'anon'
+  return crypto.createHash('sha256').update([profile, ...parts].join('|')).digest('hex')
+}
+
+function withIdempotency(data: unknown, key: string): RequestInit {
   return {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Idempotency-Key': crypto.randomUUID(),
+      'Idempotency-Key': key,
     },
     body: JSON.stringify(data),
+  }
+}
+
+// ── Wait-loop engine ────────────────────────────────────────
+//
+// The contract: a play command makes one tool call per decision and that call
+// blocks until the agent has something to do (its turn / a reaction window) or
+// the game is over. `wait` and `turn` share this loop so that acting is itself
+// re-arming — there is no idle gap between moves where a background agent can
+// fall out of the loop.
+
+// A decision is required now. `phase_start` is included because reaction
+// windows (Coup challenges, poker betting rounds) wake on phase, not your_turn.
+const ACTIONABLE_REASONS = new Set(['your_turn', 'phase_start'])
+// The game is over for me; stop. Absorbed by neither side: chat/timeout.
+const TERMINAL_REASONS = new Set(['game_over', 'eliminated', 'game_cancelled'])
+
+function isTerminal(reason: string | undefined, gameStatus?: string): boolean {
+  if (gameStatus === 'cancelled' || gameStatus === 'finished' || gameStatus === 'aborted') return true
+  return reason !== undefined && TERMINAL_REASONS.has(reason)
+}
+
+function isActionable(reason: string | undefined): boolean {
+  return reason !== undefined && ACTIONABLE_REASONS.has(reason)
+}
+
+// Default cap on a single blocking call. The server long-polls ~60s per cycle;
+// a background agent's harness kills tool calls that run too long (Claude
+// Code's Bash tool defaults to 120s). So we bound total wall-clock and refuse
+// to *start* a poll that could blow the budget — re-arm's value is absorbing
+// fast successive chat/phase events during active play, not stacking idle 60s
+// polls. Lower --max-wait if your harness limit is tighter.
+const DEFAULT_MAX_WAIT_S = 110
+const ASSUMED_SERVER_POLL_MS = 60_000
+
+interface WaitRaw {
+  reason?: string
+  eventId?: number
+  nextSinceEventId?: number
+  gameStatus?: string
+  unchanged?: boolean
+  stateText?: string
+  recentChat?: unknown
+  timeRemaining?: number
+  state?: unknown
+  missedTurns?: unknown
+  [k: string]: unknown
+}
+
+/**
+ * One long-poll of the wait endpoint, retrying transient failures internally
+ * (409 concurrent-wait, 429, 5xx, network) with capped backoff, honoring
+ * Retry-After, and failing fast on a genuine 4xx (403/404/auth). This is the
+ * fix for the old `--follow` loop, which blind-retried *everything* forever.
+ */
+async function pollWaitOnce(url: string): Promise<WaitRaw> {
+  let backoff = 1000
+  for (;;) {
+    const res = await requestMayFail<WaitRaw>(url)
+    if (res.ok) return (res.data ?? {}) as WaitRaw
+    const transient = res.status === 0 || res.status === 409 || res.status === 429 || res.status >= 500
+    if (!transient) {
+      if (res.status === 401) fail('Authentication failed. Run `prompted login` to sign in again.')
+      fail(res.error ?? `wait failed: ${res.status}`)
+    }
+    await sleep(res.retryAfterMs ?? backoff)
+    backoff = Math.min(backoff * 2, 15_000)
+  }
+}
+
+interface WaitLoopResult extends WaitRaw {
+  reason: string
+  actionable: boolean
+  terminal: boolean
+  /** Cursor to pass as the next --since. */
+  cursor: number
+  /** Chat absorbed while re-arming, so nothing is lost when chat is swallowed. */
+  pendingChat?: unknown[]
+}
+
+interface WaitLoopOptions {
+  safeGameId: string
+  cursor: number
+  lastEventId?: number
+  format: OutputFormat
+  maxWaitMs: number
+  /** 'absorb' (default) buffers chat and keeps waiting; 'return' yields on each chat. */
+  onChat: 'absorb' | 'return'
+}
+
+/**
+ * Re-arm until actionable or terminal. Absorbs `timeout` and `chat` internally;
+ * accumulates swallowed chat into `pendingChat`. On budget exhaustion returns
+ * `wait_budget_exhausted` with the live cursor so the caller re-issues cheaply.
+ */
+async function waitUntilActionable(opts: WaitLoopOptions): Promise<WaitLoopResult> {
+  const start = Date.now()
+  let cursor = opts.cursor
+  let lastEventId = opts.lastEventId
+  const pendingChat: unknown[] = []
+
+  for (;;) {
+    let url = `/api/games/${opts.safeGameId}/wait?since_event_id=${cursor}`
+    if (lastEventId !== undefined) url += `&last_event_id=${lastEventId}`
+    url = appendFormatParam(url, opts.format)
+
+    const data = await pollWaitOnce(url)
+    const reason = data.reason ?? 'timeout'
+    if (typeof data.nextSinceEventId === 'number') cursor = data.nextSinceEventId
+    if (reason !== 'timeout' && typeof data.eventId === 'number') lastEventId = data.eventId
+
+    const collect = (): unknown[] | undefined => {
+      if (Array.isArray(data.recentChat) && data.recentChat.length > 0) pendingChat.push(...data.recentChat)
+      return pendingChat.length > 0 ? pendingChat : undefined
+    }
+
+    if (isTerminal(reason, data.gameStatus)) {
+      return { ...data, reason, actionable: false, terminal: true, cursor, pendingChat: collect() }
+    }
+    if (reason === 'chat') {
+      collect()
+      if (opts.onChat === 'return') {
+        return { ...data, reason, actionable: false, terminal: false, cursor, pendingChat: pendingChat.length > 0 ? pendingChat : undefined }
+      }
+      continue
+    }
+    if (isActionable(reason)) {
+      return { ...data, reason, actionable: true, terminal: false, cursor, pendingChat: collect() }
+    }
+
+    // Non-actionable, non-terminal (timeout / unknown). Re-arm unless starting
+    // another poll could exceed the budget.
+    if (Date.now() - start + ASSUMED_SERVER_POLL_MS > opts.maxWaitMs) {
+      return { reason: 'wait_budget_exhausted', actionable: false, terminal: false, cursor, pendingChat: pendingChat.length > 0 ? pendingChat : undefined }
+    }
+  }
+}
+
+/** Render a wait/turn loop result (json line, or text with the derived fields). */
+function outputLoopResult(result: WaitLoopResult, format: OutputFormat): void {
+  if (format === 'text') {
+    if (result.pendingChat && result.pendingChat.length > 0) {
+      console.log(`pendingChat: ${JSON.stringify(result.pendingChat)}`)
+    }
+    console.log(`actionable: ${result.actionable}`)
+    console.log(`terminal: ${result.terminal}`)
+    outputStateText(result, 'text')
+    return
+  }
+  output(result)
+}
+
+function parseMaxWaitMs(value: string | undefined): number {
+  if (value === undefined) return DEFAULT_MAX_WAIT_S * 1000
+  const n = Number(value)
+  if (!Number.isFinite(n) || n <= 0) fail(`Invalid --max-wait "${value}". Use a positive number of seconds.`)
+  return n * 1000
+}
+
+function parseOnChat(value: string | undefined): 'absorb' | 'return' {
+  if (value === undefined || value === 'absorb') return 'absorb'
+  if (value === 'return') return 'return'
+  fail(`Invalid --on-chat "${value}". Use 'absorb' or 'return'.`)
+}
+
+// ── Structured turn submission ──────────────────────────────
+
+type TurnErrorClass = 'illegal_action' | 'transient' | 'auth' | 'forbidden' | 'not_found' | 'fatal'
+
+interface TurnSuccess { ok: true; data: unknown }
+interface TurnFailure {
+  ok: false
+  errorClass: TurnErrorClass
+  retryable: boolean
+  error?: string
+  status?: number
+  retryAfterMs?: number
+  legalActions?: unknown
+  state?: unknown
+  cursorUnchanged?: boolean
+}
+type TurnResult = TurnSuccess | TurnFailure
+
+/**
+ * Submit a turn, returning a structured result instead of crashing on
+ * recoverable failures. Illegal moves come back with `legalActions` (the agent
+ * picks a legal one and re-issues); transient failures are retried internally
+ * with backoff; only genuinely fatal cases surface as hard errors to the caller.
+ */
+async function submitTurn(safeGameId: string, action: unknown, key: string): Promise<TurnResult> {
+  const MAX_ATTEMPTS = 4
+  let backoff = 500
+  for (let attempt = 1; ; attempt++) {
+    const res = await requestMayFail<Record<string, unknown>>(
+      `/api/games/${safeGameId}/turn`, withIdempotency({ action }, key),
+    )
+    if (res.ok) return { ok: true, data: res.data }
+
+    const status = res.status
+    if (status === 400) {
+      // Rejected on its merits: the move never applied, the cursor is unchanged,
+      // and the server hands back the current legal actions.
+      const body = (res.data ?? {}) as Record<string, unknown>
+      return {
+        ok: false, errorClass: 'illegal_action', retryable: false, cursorUnchanged: true,
+        error: res.error, status, legalActions: body.legalActions, state: body.state,
+      }
+    }
+    if (status === 401) return { ok: false, errorClass: 'auth', retryable: false, error: res.error, status }
+    if (status === 403) return { ok: false, errorClass: 'forbidden', retryable: false, error: res.error, status }
+    if (status === 404) return { ok: false, errorClass: 'not_found', retryable: false, error: res.error, status }
+
+    const transient = status === 0 || status === 409 || status === 429 || status >= 500
+    if (transient && attempt < MAX_ATTEMPTS) {
+      await sleep(res.retryAfterMs ?? backoff)
+      backoff = Math.min(backoff * 2, 8000)
+      continue
+    }
+    if (transient) {
+      return { ok: false, errorClass: 'transient', retryable: true, error: res.error, status, retryAfterMs: res.retryAfterMs ?? backoff }
+    }
+    return { ok: false, errorClass: 'fatal', retryable: false, error: res.error, status }
   }
 }
 
@@ -803,6 +1100,8 @@ program
   .addOption(new Option('--host <url>', 'Server URL').default(process.env.PROMPTED_SERVER ?? DEFAULT_SERVER).hideHelp())
   .option('--pretty', 'Pretty-print JSON output')
   .option('--player <name>', 'Play as this named Lab player (or set PROMPTED_PLAYER); created automatically on first use')
+  .option('--verbose', 'Log one NDJSON line per request to stderr (or set PROMPTED_LOG=debug)')
+  .addOption(new Option('--idempotency-key <key>', 'Override the content-derived idempotency key for writes').hideHelp())
 
 // ── Auth commands ───────────────────────────────────────────
 
@@ -1196,30 +1495,97 @@ program.command('create')
     output(await requestWithIdentityHint('/api/games', jsonBody({ type: opts.type, maxPlayers: opts.maxPlayers })))
   })
 
+/** One-line stderr hint after a seat is secured: where you are, what's next. */
+function printReadyHint(verb: string, id: string | undefined, status: string | undefined): void {
+  if (!id) return
+  console.error(`${verb} game ${id} (${status ?? 'unknown'}). Next: prompted wait ${id} --since 0  (blocks until it's your move).`)
+}
+
 program.command('join')
-  .description('Join a custom Lab game (requires --player)')
+  .description('Join a custom Lab game (requires --player); idempotent — already being in the game is success')
   .argument('<game-id>', 'Game ID')
   .action(async (gameId) => {
     requireLabIdentity()
     await useLabProfile({ createIfMissing: true })
     const safeGameId = validateId(gameId, 'game-id')
-    output(await requestWithIdentityHint(`/api/games/${safeGameId}/join`, jsonBody({})))
+    const res = await requestMayFail<{ id?: string; status?: string }>(`/api/games/${safeGameId}/join`, jsonBody({}))
+    if (res.ok) {
+      const data = res.data ?? {}
+      printReadyHint('Joined', data.id ?? gameId, data.status)
+      output(data)
+      return
+    }
+    // Idempotent: "already in this game" is success — report the live state.
+    if (res.status === 409 || /already|in (this|the) game/i.test(res.error ?? '')) {
+      const state = await request<{ id?: string; status?: string }>(`/api/games/${safeGameId}`)
+      console.error(`Already in game ${gameId}.`)
+      printReadyHint('In', state.id ?? gameId, state.status)
+      output(state)
+      return
+    }
+    if (res.status === 401) fail('Authentication failed. Run `prompted login` to sign in again.')
+    if (res.status === 403) {
+      const hint = getSelectedPlayer()
+        ? 'You are playing as a Lab player (via --player / PROMPTED_PLAYER). Drop it to use your main account.'
+        : 'Lab play needs a named player: add --player <name> or set PROMPTED_PLAYER=<name>; the profile is created automatically.'
+      fail(`${res.error ?? 'Forbidden'} ${hint}`)
+    }
+    fail(res.error ?? `Request failed: ${res.status}`)
   })
 
 program.command('turn')
-  .description('Submit a turn action')
+  .description('Submit an action, then block until your next decision (or the game ends). Acting is re-arming.')
   .argument('<game-id>', 'Game ID')
   .requiredOption('--action <json>', 'Action as JSON string')
+  .option('--chat <text>', 'Send this chat with the action, in the same call')
+  .option('--no-wait', 'Submit and return immediately (for an orchestrator driving its own wait loop)')
+  .option('--since <cursor>', 'Cursor from your last wait; seeds the post-move wait and the idempotency key', '0')
+  .option('--max-wait <s>', 'Cap the post-move block, in seconds')
+  .option('--on-chat <mode>', "On chat while re-arming: 'absorb' (default) or 'return'")
+  .option('--format <format>', 'Output format: json (default) or text', 'json')
   .action(async (gameId, opts) => {
+    const format = validateOutputFormat(opts.format)
     let action: unknown
     try {
       action = JSON.parse(opts.action)
     } catch {
       fail('Invalid JSON in --action')
     }
+    const cursor = Number.parseInt(opts.since, 10) || 0
+    const maxWaitMs = parseMaxWaitMs(opts.maxWait)
+    const onChat = parseOnChat(opts.onChat)
     await useLabProfile()
     const safeGameId = validateId(gameId, 'game-id')
-    output(await request(`/api/games/${safeGameId}/turn`, withIdempotency({ action })))
+
+    const key = idempotencyKeyFor([gameId, cursor, 'turn', JSON.stringify(action)])
+    const result = await submitTurn(safeGameId, action, key)
+
+    if (!result.ok) {
+      // Fatal cases are real errors; recoverable ones (illegal move, exhausted
+      // transient) are returned as data so the agent re-issues without crashing.
+      if (result.errorClass === 'auth') fail(result.error ?? 'Authentication failed. Run `prompted login` to sign in again.')
+      if (result.errorClass === 'forbidden') fail(result.error ?? 'Forbidden')
+      if (result.errorClass === 'not_found') fail(result.error ?? `Game not found: ${gameId}`)
+      if (result.errorClass === 'fatal') fail(result.error ?? `Turn failed: ${result.status}`)
+      output(result)
+      return
+    }
+
+    // Print the accepted-turn result first: a crash between "move accepted" and
+    // "next decision" is then recoverable via `resume`.
+    output(result.data)
+
+    // Atomic-ish chat: one CLI invocation = one tool call for the agent.
+    if (opts.chat) {
+      const chatRes = await requestMayFail(`/api/games/${safeGameId}/chat`, withIdempotency({ message: opts.chat }, idempotencyKeyFor(null)))
+      if (!chatRes.ok) console.error(`Warning: chat not delivered (${chatRes.error ?? `status ${chatRes.status}`}).`)
+    }
+
+    if (opts.wait === false) return
+
+    const accepted = result.data as { nextSinceEventId?: number } | null
+    const startCursor = typeof accepted?.nextSinceEventId === 'number' ? accepted.nextSinceEventId : cursor
+    outputLoopResult(await waitUntilActionable({ safeGameId, cursor: startCursor, format, maxWaitMs, onChat }), format)
   })
 
 program.command('chat')
@@ -1229,7 +1595,8 @@ program.command('chat')
   .action(async (gameId, opts) => {
     await useLabProfile()
     const safeGameId = validateId(gameId, 'game-id')
-    output(await request(`/api/games/${safeGameId}/chat`, withIdempotency({ message: opts.message })))
+    // Random key: two identical messages are legitimately distinct, never deduped.
+    output(await request(`/api/games/${safeGameId}/chat`, withIdempotency({ message: opts.message }, idempotencyKeyFor(null))))
   })
 
 program.command('resign')
@@ -1238,62 +1605,130 @@ program.command('resign')
   .action(async (gameId) => {
     await useLabProfile()
     const safeGameId = validateId(gameId, 'game-id')
-    output(await request(`/api/games/${safeGameId}/resign`, withIdempotency({})))
+    output(await request(`/api/games/${safeGameId}/resign`, withIdempotency({}, idempotencyKeyFor([gameId, 'resign']))))
+  })
+
+program.command('leave')
+  .description('Idempotently free your player from a game (waiting or active); unlike resign, not being in the game is still success')
+  .argument('<game-id>', 'Game ID')
+  .action(async (gameId) => {
+    await useLabProfile()
+    const safeGameId = validateId(gameId, 'game-id')
+    const res = await requestMayFail(`/api/games/${safeGameId}/resign`, withIdempotency({}, idempotencyKeyFor([gameId, 'resign'])))
+    output({ ok: true, left: gameId, resigned: res.ok, note: res.ok ? undefined : (res.error ?? `status ${res.status}`) })
   })
 
 // ── Wait commands ───────────────────────────────────────────
 
+/**
+ * Spectator stream: NDJSON of every update until the game ends. Never yields
+ * control to act, so it is observer-only — actors use `wait` + `turn`. Fails
+ * fast on a real 4xx and backs off only on transient failures (the old loop
+ * blind-retried everything, including 403/404, forever).
+ */
+async function followSpectator(safeGameId: string, since: string, lastEventIdOpt: string | undefined, format: OutputFormat): Promise<void> {
+  let cursor = Number.parseInt(since, 10) || 0
+  let lastEventId: number | undefined = lastEventIdOpt ? Number.parseInt(lastEventIdOpt, 10) : undefined
+  for (;;) {
+    let url = `/api/games/${safeGameId}/wait?since_event_id=${cursor}`
+    if (lastEventId !== undefined) url += `&last_event_id=${lastEventId}`
+    const data = await pollWaitOnce(appendFormatParam(url, format))
+    if (typeof data.nextSinceEventId === 'number') cursor = data.nextSinceEventId
+    if (data.reason !== 'timeout' && typeof data.eventId === 'number') lastEventId = data.eventId
+    outputStateText(data, format)
+    if (isTerminal(data.reason, data.gameStatus)) break
+  }
+}
+
 program.command('wait')
-  .description('Long-poll for game updates; --follow streams continuously until the game ends')
+  .description('Block until your next decision (your turn / reaction window) or the game ends; absorbs timeouts and chat. --follow is a spectator stream.')
   .argument('<game-id>', 'Game ID')
-  .option('-f, --follow', 'Stream updates continuously until the game ends (NDJSON)')
-  .option('--since <event-id>', 'Since event ID', '0')
-  .option('--last-event-id <event-id>', 'Last event ID for conditional responses')
-  .option('--format <format>', 'Output format: json or text (default: text with --follow, json otherwise)')
+  .option('-f, --follow', 'Spectator stream: NDJSON until the game ends; never yields control to act')
+  .option('--since <event-id>', 'Cursor (event id) to wait from', '0')
+  .option('--last-event-id <event-id>', 'Last event ID for conditional (smaller) timeout responses')
+  .option('--max-wait <s>', 'Cap the block, in seconds')
+  .option('--on-chat <mode>', "On chat: 'absorb' (default, keep waiting) or 'return'")
+  .option('--format <format>', 'Output format: json (default) or text')
   .action(async (gameId, opts) => {
-    const format = validateOutputFormat(opts.format ?? (opts.follow ? 'text' : 'json'))
+    const format = validateOutputFormat(opts.format ?? 'json')
     await useLabProfile()
     const safeGameId = validateId(gameId, 'game-id')
 
     if (opts.follow) {
-      let cursor = Number.parseInt(opts.since, 10) || 0
-      let lastEventId: number | undefined = opts.lastEventId ? Number.parseInt(opts.lastEventId, 10) : undefined
-      while (true) {
-        try {
-          let url = `/api/games/${safeGameId}/wait?since_event_id=${cursor}`
-          if (lastEventId !== undefined) url += `&last_event_id=${lastEventId}`
-          url = appendFormatParam(url, format)
-
-          const data = await request<{
-            reason: string
-            eventId: number
-            nextSinceEventId: number
-            gameStatus?: string
-            unchanged?: boolean
-            stateText?: string
-          }>(url)
-
-          cursor = data.nextSinceEventId
-          if (data.reason !== 'timeout') lastEventId = data.eventId
-          outputStateText(data, format)
-
-          if (
-            data.reason === 'game_over' ||
-            data.reason === 'eliminated' ||
-            data.reason === 'game_cancelled' ||
-            data.gameStatus === 'cancelled'
-          ) break
-        } catch {
-          // On 409 (concurrent wait), wait and retry
-          await new Promise(r => setTimeout(r, 2000))
-        }
-      }
+      await followSpectator(safeGameId, opts.since, opts.lastEventId, format)
       return
     }
 
-    let url = `/api/games/${safeGameId}/wait?since_event_id=${opts.since}`
-    if (opts.lastEventId) url += `&last_event_id=${opts.lastEventId}`
-    outputStateText(await request(appendFormatParam(url, format)), format)
+    const result = await waitUntilActionable({
+      safeGameId,
+      cursor: Number.parseInt(opts.since, 10) || 0,
+      lastEventId: opts.lastEventId ? Number.parseInt(opts.lastEventId, 10) : undefined,
+      format,
+      maxWaitMs: parseMaxWaitMs(opts.maxWait),
+      onChat: parseOnChat(opts.onChat),
+    })
+    outputLoopResult(result, format)
+  })
+
+// ── Re-attach / liveness commands ───────────────────────────
+
+interface SeatSnapshot {
+  isYourTurn: boolean
+  actionable: boolean
+  terminal: boolean
+  reason: string
+  currentCursor: number
+  [k: string]: unknown
+}
+
+program.command('resume')
+  .description('Re-attach after a crash/disconnect: if it is your turn, report it and stop so you can act; otherwise block until it is')
+  .argument('<game-id>', 'Game ID')
+  .option('--max-wait <s>', 'Cap the block, in seconds')
+  .option('--on-chat <mode>', "On chat: 'absorb' (default) or 'return'")
+  .option('--format <format>', 'Output format: json (default) or text', 'json')
+  .action(async (gameId, opts) => {
+    const format = validateOutputFormat(opts.format)
+    await useLabProfile()
+    const safeGameId = validateId(gameId, 'game-id')
+    // Authoritative snapshot from the server (no client-side turn derivation).
+    const seat = await request<SeatSnapshot>(`/api/games/${safeGameId}/seat`)
+    if (seat.terminal || seat.isYourTurn) { output(seat); return }
+    // Not your turn: drop into the re-arming wait from the server's cursor.
+    outputLoopResult(await waitUntilActionable({
+      safeGameId,
+      cursor: seat.currentCursor,
+      format,
+      maxWaitMs: parseMaxWaitMs(opts.maxWait),
+      onChat: parseOnChat(opts.onChat),
+    }), format)
+  })
+
+program.command('whoseturn')
+  .description('Read-only liveness probe: is it your turn right now? (authoritative, no blocking)')
+  .argument('<game-id>', 'Game ID')
+  .action(async (gameId) => {
+    await useLabProfile()
+    const safeGameId = validateId(gameId, 'game-id')
+    output(await request(`/api/games/${safeGameId}/seat`))
+  })
+
+program.command('replay')
+  .description('Dump all game events as NDJSON with per-event deltaMs, for post-mortems')
+  .argument('<game-id>', 'Game ID')
+  .option('--type <type>', 'Filter by event type')
+  .action(async (gameId, opts) => {
+    await useLabProfile()
+    const safeGameId = validateId(gameId, 'game-id')
+    const qs = opts.type ? `?type=${encodeURIComponent(opts.type)}` : ''
+    const data = await request<{ events?: GameEventEntry[] }>(`/api/games/${safeGameId}/events${qs}`)
+    let prev: number | null = null
+    for (const ev of data.events ?? []) {
+      const t = typeof ev.createdAt === 'string' ? Date.parse(ev.createdAt) : NaN
+      const deltaMs = prev !== null && !Number.isNaN(t) ? t - prev : 0
+      if (!Number.isNaN(t)) prev = t
+      console.log(JSON.stringify({ ...ev, deltaMs }))
+    }
   })
 
 // ── Matchmaking commands ────────────────────────────────────
@@ -1354,6 +1789,14 @@ interface ReadyResponse {
   error?: string
 }
 
+/** Output a matched result and print the play-loop hint to stderr. */
+function outputMatched(data: { gameId?: string; gameType?: string; matched?: boolean }): void {
+  output(data)
+  if (data.gameId) {
+    console.error(`Matched ${data.gameType ?? ''} game ${data.gameId}. Next: prompted wait ${data.gameId} --since 0  (blocks until it's your move).`)
+  }
+}
+
 /** Shared poll loop: long-polls /wait, handles ready-check handshake, outputs result. */
 async function pollUntilMatched(queueId: string): Promise<void> {
   while (true) {
@@ -1363,7 +1806,7 @@ async function pollUntilMatched(queueId: string): Promise<void> {
       )
 
       if (data.matched && data.gameId) {
-        output(data)
+        outputMatched(data)
         return
       }
 
@@ -1381,7 +1824,7 @@ async function pollUntilMatched(queueId: string): Promise<void> {
             )
 
             if (readyResult.allReady && readyResult.gameId) {
-              output({ matched: true, gameId: readyResult.gameId, gameType: data.gameType })
+              outputMatched({ matched: true, gameId: readyResult.gameId, gameType: data.gameType })
               return
             }
 
@@ -1412,7 +1855,7 @@ async function queueAndWait(body: Record<string, unknown>): Promise<void> {
   const queueResult = await queueForMatch(body)
 
   if (queueResult.matched && queueResult.gameId) {
-    output(queueResult)
+    outputMatched(queueResult)
     return
   }
 
@@ -1541,6 +1984,6 @@ program.command('init')
 
 // ── Run ─────────────────────────────────────────────────────
 
-program.parseAsync(extractPlayerFlag(process.argv)).catch((err) => {
+program.parseAsync(extractGlobalFlags(process.argv)).catch((err) => {
   fail(err instanceof Error ? err.message : String(err))
 })

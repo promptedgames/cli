@@ -136,6 +136,7 @@ interface RecordedRequest {
   method: string
   url: string
   auth: string | null
+  idempotencyKey: string | null
   body: unknown
 }
 
@@ -149,6 +150,7 @@ function startMockServer(handler: (req: RecordedRequest, res: ServerResponse) =>
         method: req.method ?? '',
         url: req.url ?? '',
         auth: (req.headers.authorization as string | undefined) ?? null,
+        idempotencyKey: (req.headers['idempotency-key'] as string | undefined) ?? null,
         body: data ? JSON.parse(data) : null,
       }
       requests.push(recorded)
@@ -550,6 +552,290 @@ describe('prompted CLI with mock server', () => {
       expect(events).toContain('game_start')
       expect(events).toContain('2 players')
       expect(events).not.toContain('large-secret-state')
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  // ── Play-loop contract ─────────────────────────────────────
+
+  it('wait re-arms past a timeout and returns the actionable decision', async () => {
+    let waits = 0
+    const mock = await startMockServer((req, res) => {
+      if (req.url?.startsWith('/api/games/g1/wait')) {
+        waits++
+        if (waits === 1) { json(res, 200, { reason: 'timeout', eventId: 0, nextSinceEventId: 0 }); return }
+        json(res, 200, { reason: 'your_turn', eventId: 5, nextSinceEventId: 5, state: { legalActions: ['call'] } })
+        return
+      }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const out = JSON.parse(await ok(['wait', 'g1', '--since', '0'], env(mock.url, { PROMPTED_USER_ID: 'u1' })))
+      expect(out.reason).toBe('your_turn')
+      expect(out.actionable).toBe(true)
+      expect(out.terminal).toBe(false)
+      expect(out.cursor).toBe(5)
+      expect(waits).toBe(2) // the timeout was absorbed internally
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('wait absorbs chat and attaches it as pendingChat on the next decision', async () => {
+    let waits = 0
+    const mock = await startMockServer((req, res) => {
+      if (req.url?.startsWith('/api/games/g1/wait')) {
+        waits++
+        if (waits === 1) { json(res, 200, { reason: 'chat', eventId: 2, nextSinceEventId: 2, recentChat: [{ from: 'mary', text: 'gl' }] }); return }
+        json(res, 200, { reason: 'your_turn', eventId: 5, nextSinceEventId: 5 })
+        return
+      }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const out = JSON.parse(await ok(['wait', 'g1'], env(mock.url, { PROMPTED_USER_ID: 'u1' })))
+      expect(out.reason).toBe('your_turn')
+      expect(out.pendingChat).toEqual([{ from: 'mary', text: 'gl' }])
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('wait --on-chat return yields on each chat', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url?.startsWith('/api/games/g1/wait')) {
+        json(res, 200, { reason: 'chat', eventId: 2, nextSinceEventId: 2, recentChat: [{ text: 'hi' }] })
+        return
+      }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const out = JSON.parse(await ok(['wait', 'g1', '--on-chat', 'return'], env(mock.url, { PROMPTED_USER_ID: 'u1' })))
+      expect(out.reason).toBe('chat')
+      expect(out.actionable).toBe(false)
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('turn submits then auto-waits, printing the accepted result before the next decision', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url === '/api/games/g1/turn') { json(res, 200, { ok: true, nextSinceEventId: 6 }); return }
+      if (req.url?.startsWith('/api/games/g1/wait')) { json(res, 200, { reason: 'your_turn', eventId: 8, nextSinceEventId: 8 }); return }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const out = await ok(['turn', 'g1', '--action', '{"action":"call"}', '--since', '5'], env(mock.url, { PROMPTED_USER_ID: 'u1' }))
+      const lines = out.split('\n').map((l) => JSON.parse(l))
+      expect(lines[0].ok).toBe(true) // accepted-turn result, printed first
+      expect(lines[1].reason).toBe('your_turn') // next decision after auto-wait
+      // auto-wait started from the accepted result's cursor (6), not --since (5)
+      const waitReq = mock.requests.find((r) => r.url?.startsWith('/api/games/g1/wait'))
+      expect(waitReq!.url).toContain('since_event_id=6')
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('turn --no-wait returns immediately without waiting', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url === '/api/games/g1/turn') { json(res, 200, { ok: true }); return }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const out = await ok(['turn', 'g1', '--action', '{"action":"check"}', '--no-wait'], env(mock.url, { PROMPTED_USER_ID: 'u1' }))
+      expect(JSON.parse(out).ok).toBe(true)
+      expect(mock.requests.some((r) => r.url?.startsWith('/api/games/g1/wait'))).toBe(false)
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('turn on an illegal move returns a structured envelope with legalActions (exit 0)', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url === '/api/games/g1/turn') { json(res, 400, { error: 'illegal move', legalActions: ['fold', 'call'] }); return }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const out = await ok(['turn', 'g1', '--action', '{"action":"raise"}'], env(mock.url, { PROMPTED_USER_ID: 'u1' }))
+      const parsed = JSON.parse(out)
+      expect(parsed.ok).toBe(false)
+      expect(parsed.errorClass).toBe('illegal_action')
+      expect(parsed.retryable).toBe(false)
+      expect(parsed.cursorUnchanged).toBe(true)
+      expect(parsed.legalActions).toEqual(['fold', 'call'])
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('turn idempotency key is content-derived and stable across identical retries', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url === '/api/games/g1/turn') { json(res, 200, { ok: true }); return }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const e = env(mock.url, { PROMPTED_USER_ID: 'u1' })
+      await ok(['turn', 'g1', '--action', '{"action":"call"}', '--since', '5', '--no-wait'], e)
+      await ok(['turn', 'g1', '--action', '{"action":"call"}', '--since', '5', '--no-wait'], e)
+      const keys = mock.requests.filter((r) => r.url === '/api/games/g1/turn').map((r) => r.idempotencyKey)
+      expect(keys).toHaveLength(2)
+      expect(keys[0]).toBeTruthy()
+      expect(keys[0]).toBe(keys[1]) // same profile|game|cursor|action -> same key
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('chat idempotency keys differ for identical messages (never deduped)', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url === '/api/games/g1/chat') { json(res, 200, { ok: true }); return }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const e = env(mock.url, { PROMPTED_USER_ID: 'u1' })
+      await ok(['chat', 'g1', '--message', 'ja'], e)
+      await ok(['chat', 'g1', '--message', 'ja'], e)
+      const keys = mock.requests.filter((r) => r.url === '/api/games/g1/chat').map((r) => r.idempotencyKey)
+      expect(keys[0]).not.toBe(keys[1])
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('--idempotency-key overrides the derived key', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url === '/api/games/g1/turn') { json(res, 200, { ok: true }); return }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      await ok(['--idempotency-key', 'fixed-123', 'turn', 'g1', '--action', '{"action":"call"}', '--no-wait'], env(mock.url, { PROMPTED_USER_ID: 'u1' }))
+      const turnReq = mock.requests.find((r) => r.url === '/api/games/g1/turn')
+      expect(turnReq!.idempotencyKey).toBe('fixed-123')
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('wait --follow fails fast on a 404 instead of looping forever', async () => {
+    const mock = await startMockServer((req, res) => {
+      json(res, 404, { error: 'game not found' })
+    })
+    try {
+      const result = await runAsync(['wait', 'g1', '--follow'], env(mock.url, { PROMPTED_USER_ID: 'u1' }))
+      expect(result.code).not.toBe(0)
+      expect(result.stderr).toContain('game not found')
+      // One request, not an endless retry storm.
+      expect(mock.requests.length).toBe(1)
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('leave is idempotent even when the player is not in the game', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url === '/api/games/g1/resign') { json(res, 400, { error: 'not in this game' }); return }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const out = JSON.parse(await ok(['leave', 'g1'], env(mock.url, { PROMPTED_USER_ID: 'u1' })))
+      expect(out.ok).toBe(true)
+      expect(out.resigned).toBe(false)
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('replay emits NDJSON with per-event deltaMs', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url === '/api/games/g1/events') {
+        json(res, 200, { events: [
+          { eventIndex: 1, type: 'game_start', createdAt: '2026-06-14T12:00:00.000Z' },
+          { eventIndex: 2, type: 'turn', createdAt: '2026-06-14T12:00:03.000Z' },
+        ] })
+        return
+      }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const out = await ok(['replay', 'g1'], env(mock.url, { PROMPTED_USER_ID: 'u1' }))
+      const lines = out.split('\n').map((l) => JSON.parse(l))
+      expect(lines[0].deltaMs).toBe(0)
+      expect(lines[1].deltaMs).toBe(3000)
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('join is idempotent: already-in-game reports the live state as success', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url === '/api/agents/resolve') { json(res, 200, { id: 'agent-1', name: 'mary', token: 'profile-token', created: false }); return }
+      if (req.url === '/api/games/g1/join') { json(res, 409, { error: 'already in this game' }); return }
+      if (req.url === '/api/games/g1') { json(res, 200, { id: 'g1', status: 'active' }); return }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      await ok(['login', '--token', 'main-token'], env(mock.url))
+      const out = JSON.parse(await ok(['--player', 'mary', 'join', 'g1'], env(mock.url)))
+      expect(out.status).toBe('active')
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('whoseturn calls the authoritative seat endpoint', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url === '/api/games/g1/seat') {
+        json(res, 200, { isYourTurn: true, actionable: true, terminal: false, reason: 'your_turn', currentCursor: 5, legalActions: ['call'] })
+        return
+      }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const out = JSON.parse(await ok(['whoseturn', 'g1'], env(mock.url, { PROMPTED_USER_ID: 'u1' })))
+      expect(out.isYourTurn).toBe(true)
+      expect(out.reason).toBe('your_turn')
+      expect(mock.requests.some((r) => r.url === '/api/games/g1/seat')).toBe(true)
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('resume returns immediately when seat says it is your turn', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url === '/api/games/g1/seat') {
+        json(res, 200, { isYourTurn: true, actionable: true, terminal: false, reason: 'your_turn', currentCursor: 5 })
+        return
+      }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const out = JSON.parse(await ok(['resume', 'g1'], env(mock.url, { PROMPTED_USER_ID: 'u1' })))
+      expect(out.isYourTurn).toBe(true)
+      expect(mock.requests.some((r) => r.url?.startsWith('/api/games/g1/wait'))).toBe(false)
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('resume waits from the seat cursor when it is not your turn', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url === '/api/games/g1/seat') {
+        json(res, 200, { isYourTurn: false, actionable: false, terminal: false, reason: 'waiting', currentCursor: 3 })
+        return
+      }
+      if (req.url?.startsWith('/api/games/g1/wait')) {
+        json(res, 200, { reason: 'your_turn', eventId: 7, nextSinceEventId: 7 })
+        return
+      }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const out = JSON.parse(await ok(['resume', 'g1'], env(mock.url, { PROMPTED_USER_ID: 'u1' })))
+      expect(out.reason).toBe('your_turn')
+      const waitReq = mock.requests.find((r) => r.url?.startsWith('/api/games/g1/wait'))
+      expect(waitReq!.url).toContain('since_event_id=3')
     } finally {
       mock.server.close()
     }
