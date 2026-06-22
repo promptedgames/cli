@@ -670,6 +670,119 @@ describe('prompted CLI with mock server', () => {
     }
   })
 
+  it('turn on a stale "not your turn" 400 re-waits for the real next decision instead of surfacing illegal_action', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url === '/api/games/g1/turn') { json(res, 400, { error: 'Not your turn', code: 'stale_turn' }); return }
+      if (req.url?.startsWith('/api/games/g1/wait')) { json(res, 200, { reason: 'your_turn', eventId: 9, nextSinceEventId: 9 }); return }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const out = await ok(['turn', 'g1', '--action', '{"action":"bid","quantity":2,"face":3}', '--since', '5'], env(mock.url, { PROMPTED_USER_ID: 'u1' }))
+      const parsed = JSON.parse(out)
+      expect(parsed.reason).toBe('your_turn') // recovered the real next decision
+      expect(parsed.actionable).toBe(true)
+      // re-waited from the cursor it tried to act on (--since 5), not a fresh 0
+      const waitReq = mock.requests.find((r) => r.url?.startsWith('/api/games/g1/wait'))
+      expect(waitReq!.url).toContain('since_event_id=5')
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('turn --no-wait on a stale 400 (no code, no legalActions) returns a retryable stale_turn envelope and does not re-wait', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url === '/api/games/g1/turn') { json(res, 400, { error: 'Not your turn' }); return }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const out = await ok(['turn', 'g1', '--action', '{"action":"liar"}', '--no-wait'], env(mock.url, { PROMPTED_USER_ID: 'u1' }))
+      const parsed = JSON.parse(out)
+      expect(parsed.ok).toBe(false)
+      expect(parsed.errorClass).toBe('stale_turn') // absence of legalActions is the discriminator
+      expect(parsed.retryable).toBe(true)
+      expect(mock.requests.some((r) => r.url?.startsWith('/api/games/g1/wait'))).toBe(false)
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('wait --brief caps bulky *History arrays in state while preserving legalActions and player ids', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url?.startsWith('/api/games/g1/wait')) {
+        json(res, 200, {
+          reason: 'your_turn', eventId: 3, nextSinceEventId: 3,
+          state: {
+            legalActions: [{ action: 'liar' }],
+            currentBid: { quantity: 2, face: 3 },
+            players: [{ id: 'p-abc' }, { id: 'p-def' }],
+            roundHistory: [{ r: 1 }, { r: 2 }, { r: 3 }],
+          },
+        })
+        return
+      }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const out = await ok(['wait', 'g1', '--brief'], env(mock.url, { PROMPTED_USER_ID: 'u1' }))
+      const parsed = JSON.parse(out)
+      expect(parsed.state.roundHistory).toEqual([{ r: 3 }]) // capped to last entry
+      expect(parsed.state.roundHistoryTruncated).toBe(true)
+      expect(parsed.state.legalActions).toEqual([{ action: 'liar' }]) // preserved
+      expect(parsed.state.players).toEqual([{ id: 'p-abc' }, { id: 'p-def' }]) // ids preserved (unlike --format text)
+      expect(parsed.state.currentBid).toEqual({ quantity: 2, face: 3 })
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('warns loudly on stderr (keeping stdout machine-clean) when the server auto-played a missed turn', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url?.startsWith('/api/games/g1/wait')) {
+        json(res, 200, {
+          reason: 'your_turn', eventId: 3, nextSinceEventId: 3,
+          missedTurns: [{ action: 'check', summary: 'Turn timed out, auto-played: check', defaultPolicy: 'auto_check' }],
+          state: { legalActions: [] },
+        })
+        return
+      }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const result = await runAsync(['wait', 'g1'], env(mock.url, { PROMPTED_USER_ID: 'u1' }))
+      expect(result.code, result.stderr).toBe(0)
+      expect(result.stderr).toContain('you were auto-played: check')
+      expect(result.stderr).toContain('auto_check')
+      expect(JSON.parse(result.stdout).reason).toBe('your_turn') // stdout stays clean JSON
+    } finally {
+      mock.server.close()
+    }
+  })
+
+  it('warns on stderr when the server granted a grace extension, and passes timeoutStrikes through', async () => {
+    const mock = await startMockServer((req, res) => {
+      if (req.url?.startsWith('/api/games/g1/wait')) {
+        json(res, 200, {
+          reason: 'your_turn', eventId: 4, nextSinceEventId: 4,
+          graceExtensions: [{ eventIndex: 4, graceMsAdded: 30000, strikesUsed: 1, strikesLeft: 1, summary: 'Turn deadline missed; granted 30s grace (strike 1 of 2).' }],
+          timeoutStrikes: { used: 1, max: 2 },
+          state: { legalActions: [] },
+        })
+        return
+      }
+      json(res, 404, { error: 'not found' })
+    })
+    try {
+      const result = await runAsync(['wait', 'g1'], env(mock.url, { PROMPTED_USER_ID: 'u1' }))
+      expect(result.code, result.stderr).toBe(0)
+      expect(result.stderr).toContain('grace extension')
+      expect(result.stderr).toContain('strike 1/2')
+      const parsed = JSON.parse(result.stdout)
+      expect(parsed.timeoutStrikes).toEqual({ used: 1, max: 2 }) // reaches the agent in the JSON
+    } finally {
+      mock.server.close()
+    }
+  })
+
   it('turn idempotency key is content-derived and stable across identical retries', async () => {
     const mock = await startMockServer((req, res) => {
       if (req.url === '/api/games/g1/turn') { json(res, 200, { ok: true }); return }
