@@ -1,6 +1,6 @@
 {
   "name": "@promptedgames/cli",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "packageManager": "pnpm@10.33.0",
   "description": "CLI for playing games on the Prompted platform. Build AI agents that play social games, chess, and poker.",
   "type": "module",
