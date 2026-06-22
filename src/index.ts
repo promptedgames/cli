@@ -256,6 +256,24 @@ function appendFormatParam(path: string, format?: string): string {
   return `${path}${path.includes('?') ? '&' : '?'}format=text`
 }
 
+/** A turn the server auto-played because the agent missed the clock. */
+interface MissedTurn {
+  action: string
+  summary: string
+  /** The conservative no-commitment move the server chose (e.g. auto_check, auto_fold, no_action). */
+  defaultPolicy?: string
+  eventIndex?: number
+}
+
+/** A grace extension the server granted on a missed deadline (before any auto-play). */
+interface GraceExtension {
+  graceMsAdded: number
+  strikesUsed: number
+  strikesLeft: number
+  summary: string
+  eventIndex?: number
+}
+
 function outputStateText(data: unknown, format?: string) {
   if (isTextFormat(format) && typeof data === 'object' && data !== null) {
     const obj = data as Record<string, unknown>
@@ -266,8 +284,9 @@ function outputStateText(data: unknown, format?: string) {
       if (obj.eventId !== undefined) console.log(`eventId: ${obj.eventId}`)
       if (obj.timeRemaining !== undefined) console.log(`timeRemaining: ${obj.timeRemaining}s`)
       if (Array.isArray(obj.missedTurns) && obj.missedTurns.length > 0) {
-        for (const mt of obj.missedTurns as Array<{ action: string; summary: string }>) {
-          console.log(`WARNING: ${mt.summary}`)
+        for (const mt of obj.missedTurns as MissedTurn[]) {
+          const policy = mt.defaultPolicy ? ` (policy: ${mt.defaultPolicy})` : ''
+          console.log(`WARNING: ${mt.summary}${policy}`)
         }
       }
       console.log('')
@@ -909,7 +928,8 @@ interface WaitRaw {
   recentChat?: unknown
   timeRemaining?: number
   state?: unknown
-  missedTurns?: unknown
+  missedTurns?: MissedTurn[]
+  graceExtensions?: GraceExtension[]
   [k: string]: unknown
 }
 
@@ -1002,8 +1022,69 @@ async function waitUntilActionable(opts: WaitLoopOptions): Promise<WaitLoopResul
   }
 }
 
+/**
+ * Loud, hard-to-miss alert on stderr (so stdout stays machine-clean in JSON
+ * mode) whenever the server auto-played a turn we missed. A missed turn is
+ * otherwise buried in a `missedTurns` field and easy to overlook — which is
+ * exactly how agents lose the clock without noticing.
+ */
+function warnMissedTurns(missedTurns: MissedTurn[] | undefined): void {
+  if (!missedTurns || missedTurns.length === 0) return
+  for (const mt of missedTurns) {
+    const policy = mt.defaultPolicy ? ` (policy: ${mt.defaultPolicy})` : ''
+    console.error(
+      `⚠️  you were auto-played: ${mt.action}${policy} — "${mt.summary}". ` +
+      'You are losing the turn clock; act faster / submit action-only.',
+    )
+  }
+}
+
+/**
+ * Client-side `--brief` projection: drop bulky `*History` arrays from `state`
+ * (the main driver of late-game context bloat) while keeping everything an agent
+ * needs to act — `legalActions`, the clock, ids, and private info. The most
+ * recent history entry is retained so the latest outcome is still visible. Pure
+ * projection of an already-received payload, so it preserves ids (unlike
+ * `--format text`).
+ */
+function projectBrief<T>(payload: T): T {
+  if (!payload || typeof payload !== 'object') return payload
+  const top = payload as Record<string, unknown>
+  const state = top.state
+  if (!state || typeof state !== 'object') return payload
+  const trimmed: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(state as Record<string, unknown>)) {
+    if (Array.isArray(value) && /History$/.test(key) && value.length > 1) {
+      trimmed[key] = value.slice(-1)
+      trimmed[`${key}Truncated`] = true
+    } else {
+      trimmed[key] = value
+    }
+  }
+  return { ...top, state: trimmed } as T
+}
+
+/**
+ * Note on stderr when the server granted a grace extension instead of
+ * auto-playing a missed deadline: you overran the clock but kept your turn. The
+ * next miss auto-plays, so submit now and tighten up.
+ */
+function warnGraceExtensions(graces: GraceExtension[] | undefined): void {
+  if (!graces || graces.length === 0) return
+  for (const g of graces) {
+    const total = g.strikesUsed + g.strikesLeft
+    console.error(
+      `⏱️  grace extension: you missed the turn deadline but kept your turn ` +
+      `(+${Math.round(g.graceMsAdded / 1000)}s, strike ${g.strikesUsed}/${total}). ` +
+      'Submit now — the next miss is auto-played for you.',
+    )
+  }
+}
+
 /** Render a wait/turn loop result (json line, or text with the derived fields). */
-function outputLoopResult(result: WaitLoopResult, format: OutputFormat): void {
+function outputLoopResult(result: WaitLoopResult, format: OutputFormat, brief = false): void {
+  warnMissedTurns(result.missedTurns)
+  warnGraceExtensions(result.graceExtensions)
   if (format === 'text') {
     if (result.pendingChat && result.pendingChat.length > 0) {
       console.log(`pendingChat: ${JSON.stringify(result.pendingChat)}`)
@@ -1013,7 +1094,7 @@ function outputLoopResult(result: WaitLoopResult, format: OutputFormat): void {
     outputStateText(result, 'text')
     return
   }
-  output(result)
+  output(brief ? projectBrief(result) : result)
 }
 
 function parseMaxWaitMs(value: string | undefined): number {
@@ -1031,7 +1112,7 @@ function parseOnChat(value: string | undefined): 'absorb' | 'return' {
 
 // ── Structured turn submission ──────────────────────────────
 
-type TurnErrorClass = 'illegal_action' | 'transient' | 'auth' | 'forbidden' | 'not_found' | 'fatal'
+type TurnErrorClass = 'illegal_action' | 'stale_turn' | 'transient' | 'auth' | 'forbidden' | 'not_found' | 'fatal'
 
 interface TurnSuccess { ok: true; data: unknown }
 interface TurnFailure {
@@ -1064,9 +1145,22 @@ async function submitTurn(safeGameId: string, action: unknown, key: string): Pro
 
     const status = res.status
     if (status === 400) {
+      const body = (res.data ?? {}) as Record<string, unknown>
+      // Distinguish a *timing* 400 ("not your turn" / "not active" / wrong phase)
+      // from a genuine illegal move. A timing 400 carries no `legalActions` (and,
+      // on newer servers, an explicit `code: 'stale_turn'`): re-picking an action
+      // is wrong — the agent must re-wait for its real next decision. This is the
+      // round-boundary race where a post-`liar` auto-wait surfaced an actionable
+      // `your_turn` the turn endpoint then rejected.
+      const isStaleTurn = body.code === 'stale_turn' || body.legalActions === undefined
+      if (isStaleTurn) {
+        return {
+          ok: false, errorClass: 'stale_turn', retryable: true, cursorUnchanged: true,
+          error: res.error, status, state: body.state,
+        }
+      }
       // Rejected on its merits: the move never applied, the cursor is unchanged,
       // and the server hands back the current legal actions.
-      const body = (res.data ?? {}) as Record<string, unknown>
       return {
         ok: false, errorClass: 'illegal_action', retryable: false, cursorUnchanged: true,
         error: res.error, status, legalActions: body.legalActions, state: body.state,
@@ -1542,9 +1636,11 @@ program.command('turn')
   .option('--since <cursor>', 'Cursor from your last wait; seeds the post-move wait and the idempotency key', '0')
   .option('--max-wait <s>', 'Cap the post-move block, in seconds')
   .option('--on-chat <mode>', "On chat while re-arming: 'absorb' (default) or 'return'")
+  .option('--brief', 'Strip bulky *History arrays from the JSON state to keep each turn small (ids preserved)')
   .option('--format <format>', 'Output format: json (default) or text', 'json')
   .action(async (gameId, opts) => {
     const format = validateOutputFormat(opts.format)
+    const brief = opts.brief === true
     let action: unknown
     try {
       action = JSON.parse(opts.action)
@@ -1567,13 +1663,23 @@ program.command('turn')
       if (result.errorClass === 'forbidden') fail(result.error ?? 'Forbidden')
       if (result.errorClass === 'not_found') fail(result.error ?? `Game not found: ${gameId}`)
       if (result.errorClass === 'fatal') fail(result.error ?? `Turn failed: ${result.status}`)
+
+      // A stale turn (round-boundary race / "not your turn"): the move never
+      // applied, so don't hand back an illegal-action envelope that pushes the
+      // agent into re-picking. Re-wait for its real next decision instead —
+      // unless --no-wait, where the orchestrator drives its own wait loop.
+      if (result.errorClass === 'stale_turn' && opts.wait !== false) {
+        console.error('Turn was stale (not your turn for that cursor); re-waiting for your next decision.')
+        outputLoopResult(await waitUntilActionable({ safeGameId, cursor, format, maxWaitMs, onChat }), format, brief)
+        return
+      }
       output(result)
       return
     }
 
     // Print the accepted-turn result first: a crash between "move accepted" and
     // "next decision" is then recoverable via `resume`.
-    output(result.data)
+    output(brief ? projectBrief(result.data) : result.data)
 
     // Atomic-ish chat: one CLI invocation = one tool call for the agent.
     if (opts.chat) {
@@ -1585,7 +1691,7 @@ program.command('turn')
 
     const accepted = result.data as { nextSinceEventId?: number } | null
     const startCursor = typeof accepted?.nextSinceEventId === 'number' ? accepted.nextSinceEventId : cursor
-    outputLoopResult(await waitUntilActionable({ safeGameId, cursor: startCursor, format, maxWaitMs, onChat }), format)
+    outputLoopResult(await waitUntilActionable({ safeGameId, cursor: startCursor, format, maxWaitMs, onChat }), format, brief)
   })
 
 program.command('chat')
@@ -1648,6 +1754,7 @@ program.command('wait')
   .option('--last-event-id <event-id>', 'Last event ID for conditional (smaller) timeout responses')
   .option('--max-wait <s>', 'Cap the block, in seconds')
   .option('--on-chat <mode>', "On chat: 'absorb' (default, keep waiting) or 'return'")
+  .option('--brief', 'Strip bulky *History arrays from the JSON state to keep each decision small (ids preserved)')
   .option('--format <format>', 'Output format: json (default) or text')
   .action(async (gameId, opts) => {
     const format = validateOutputFormat(opts.format ?? 'json')
@@ -1667,7 +1774,7 @@ program.command('wait')
       maxWaitMs: parseMaxWaitMs(opts.maxWait),
       onChat: parseOnChat(opts.onChat),
     })
-    outputLoopResult(result, format)
+    outputLoopResult(result, format, opts.brief === true)
   })
 
 // ── Re-attach / liveness commands ───────────────────────────
@@ -1686,14 +1793,16 @@ program.command('resume')
   .argument('<game-id>', 'Game ID')
   .option('--max-wait <s>', 'Cap the block, in seconds')
   .option('--on-chat <mode>', "On chat: 'absorb' (default) or 'return'")
+  .option('--brief', 'Strip bulky *History arrays from the JSON state to keep the snapshot small (ids preserved)')
   .option('--format <format>', 'Output format: json (default) or text', 'json')
   .action(async (gameId, opts) => {
     const format = validateOutputFormat(opts.format)
+    const brief = opts.brief === true
     await useLabProfile()
     const safeGameId = validateId(gameId, 'game-id')
     // Authoritative snapshot from the server (no client-side turn derivation).
     const seat = await request<SeatSnapshot>(`/api/games/${safeGameId}/seat`)
-    if (seat.terminal || seat.isYourTurn) { output(seat); return }
+    if (seat.terminal || seat.isYourTurn) { output(brief ? projectBrief(seat) : seat); return }
     // Not your turn: drop into the re-arming wait from the server's cursor.
     outputLoopResult(await waitUntilActionable({
       safeGameId,
@@ -1701,7 +1810,7 @@ program.command('resume')
       format,
       maxWaitMs: parseMaxWaitMs(opts.maxWait),
       onChat: parseOnChat(opts.onChat),
-    }), format)
+    }), format, brief)
   })
 
 program.command('whoseturn')
